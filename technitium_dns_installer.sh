@@ -14,6 +14,7 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
+SCRIPT_VERSION="1.1.0"
 base_dir=$(pwd)
 
 # ============================================================================ #
@@ -46,24 +47,33 @@ PURGE_DATA=${PURGE_DATA:-"false"}                # also remove /etc/dns (all zon
 REMOVE_DOTNET=${REMOVE_DOTNET:-"false"}          # also remove /opt/dotnet on uninstall
 
 # ============================================================================ #
-# -- v1.1 RESERVED variables (defined now for a stable contract; NOT yet      #
-#    active in v1.0 -- setting any of these prints a notice and is ignored).   #
-#    See specs/tools/technitium-dns-installer.spec.md "Roadmap" section.       #
+# -- Optional DNS configuration: zones/records, forwarders, DNSSEC, DHCP --    #
+#    (all off/empty by default; applied via the Technitium HTTP API)           #
 # ============================================================================ #
-DNS_FORWARDERS=${DNS_FORWARDERS:-""}                       # e.g. "1.1.1.1, 8.8.8.8"
-DNS_FORWARDER_PROTOCOL=${DNS_FORWARDER_PROTOCOL:-"Udp"}    # Udp | Tcp | Tls | Https
-ENABLE_DNSSEC=${ENABLE_DNSSEC:-"false"}                    # DNSSEC-sign created primary zones
-ZONES_TEMPLATE=${ZONES_TEMPLATE:-""}                       # path to a zone+record template file
-ENABLE_DHCP=${ENABLE_DHCP:-"false"}                        # create + enable a DHCP scope
+# -- Primary zones + A records, from a template file (see zones.template.txt) -- #
+ZONES_TEMPLATE=${ZONES_TEMPLATE:-""}                      # path to a zone+record template file
+DNS_RECORD_TTL=${DNS_RECORD_TTL:-"3600"}                  # TTL for A records created from the template
+
+# -- DNS forwarders -- #
+DNS_FORWARDERS=${DNS_FORWARDERS:-""}                      # e.g. "1.1.1.1, 8.8.8.8" (empty = root-hint recursion)
+DNS_FORWARDER_PROTOCOL=${DNS_FORWARDER_PROTOCOL:-"Udp"}   # Udp | Tcp | Tls | Https
+
+# -- DNSSEC: sign every primary zone created from ZONES_TEMPLATE -- #
+ENABLE_DNSSEC=${ENABLE_DNSSEC:-"false"}
+DNSSEC_ALGORITHM=${DNSSEC_ALGORITHM:-"ECDSA"}            # ECDSA | RSA | EDDSA
+DNSSEC_CURVE=${DNSSEC_CURVE:-"P256"}                     # for ECDSA: P256 | P384
+
+# -- DHCP scope (needs DHCP_START_ADDRESS + DHCP_END_ADDRESS when ENABLE_DHCP=true) -- #
+ENABLE_DHCP=${ENABLE_DHCP:-"false"}
 DHCP_SCOPE_NAME=${DHCP_SCOPE_NAME:-"Default"}
 DHCP_START_ADDRESS=${DHCP_START_ADDRESS:-""}
 DHCP_END_ADDRESS=${DHCP_END_ADDRESS:-""}
 DHCP_SUBNET_MASK=${DHCP_SUBNET_MASK:-"255.255.255.0"}
 DHCP_ROUTER=${DHCP_ROUTER:-""}
-DHCP_DNS_SERVERS=${DHCP_DNS_SERVERS:-""}
+DHCP_DNS_SERVERS=${DHCP_DNS_SERVERS:-""}                  # empty = advertise this DNS server (useThisDnsServer)
 DHCP_DOMAIN=${DHCP_DOMAIN:-""}
-DHCP_DNS_SEARCH=${DHCP_DNS_SEARCH:-""}
-DHCP_NTP_SERVERS=${DHCP_NTP_SERVERS:-""}
+DHCP_DNS_SEARCH=${DHCP_DNS_SEARCH:-""}                    # comma list -> domainSearchList
+DHCP_NTP_SERVERS=${DHCP_NTP_SERVERS:-""}                  # comma list -> ntpServers
 DHCP_DNS_UPDATES=${DHCP_DNS_UPDATES:-"true"}
 DHCP_LEASE_DAYS=${DHCP_LEASE_DAYS:-"1"}
 DHCP_SCOPE_ENABLED=${DHCP_SCOPE_ENABLED:-"true"}
@@ -99,6 +109,8 @@ log()  { echo "$*" | tee -a "$LOG_FILE"; }
 
 usage() {
   cat << EOF
+Technitium DNS Server Installer v$SCRIPT_VERSION
+
 Usage: $SCRIPT_NAME [command] [command ...]
 
 Commands:
@@ -114,7 +126,7 @@ Commands:
               PURGE_DATA and REMOVE_DOTNET.
   help        Show this message.
 
-Common environment overrides (see README.md for the full list):
+Core environment overrides (see README.md for the full list):
   DNS_ADMIN_PASSWORD   Admin password to set (default: changeme)
   DNS_WEB_PORT         Web console HTTP port (default: 5380)
   ENABLE_HTTPS         Serve the console over HTTPS self-signed (default: false)
@@ -122,8 +134,16 @@ Common environment overrides (see README.md for the full list):
   PURGE_DATA           uninstall also removes $DNS_CONFIG_DIR (default: false)
   REMOVE_DOTNET        uninstall also removes $DOTNET_DIR (default: false)
 
-Example:
+Optional DNS configuration (applied via the HTTP API after install):
+  ZONES_TEMPLATE       Path to a zone+record template (see zones.template.txt)
+  DNS_FORWARDERS       Comma list, e.g. "1.1.1.1, 8.8.8.8" (+ DNS_FORWARDER_PROTOCOL)
+  ENABLE_DNSSEC        Sign every zone created from the template (default: false)
+  ENABLE_DHCP          Create+enable a DHCP scope (+ DHCP_START_ADDRESS/DHCP_END_ADDRESS/...)
+
+Examples:
   sudo DNS_ADMIN_PASSWORD='S3cret!' DNS_WEB_PORT=8053 ENABLE_HTTPS=true ./$SCRIPT_NAME install
+  sudo DNS_ADMIN_PASSWORD='S3cret!' ZONES_TEMPLATE=./zones.txt \\
+       DNS_FORWARDERS='1.1.1.1, 8.8.8.8' ENABLE_DNSSEC=true ./$SCRIPT_NAME install
 EOF
   exit "${1:-1}"
 }
@@ -369,27 +389,153 @@ api_configure_web_service() {
   fi
 }
 
-# v1.0 config engine: password + web service. (v1.1 hooks invoked afterwards.)
+# Config engine. The web-service port/TLS change runs LAST so all other API calls
+# use a stable API_BASE (changing the HTTP port rebinds the listener mid-flight).
 configure_dns_server() {
+  CREATED_ZONES=()
   wait_for_webservice
   api_login_and_set_password
+  configure_forwarders
+  configure_zones_and_records
+  configure_dnssec
+  configure_dhcp
   api_configure_web_service
-  v11_feature_notice
 }
 
-# v1.1 features are not active yet -- warn loudly if a user set them so the
-# behaviour is never a silent no-op.
-v11_feature_notice() {
-  local set_flags=()
-  [[ -n "$DNS_FORWARDERS" ]]      && set_flags+=("DNS_FORWARDERS")
-  [[ -n "$ZONES_TEMPLATE" ]]      && set_flags+=("ZONES_TEMPLATE")
-  [[ "$ENABLE_DNSSEC" == "true" ]] && set_flags+=("ENABLE_DNSSEC")
-  [[ "$ENABLE_DHCP" == "true" ]]   && set_flags+=("ENABLE_DHCP")
-  if (( ${#set_flags[@]} > 0 )); then
-    log ""
-    log "NOTICE: ${set_flags[*]} -> these configure zones/records/forwarders/DHCP/DNSSEC,"
-    log "        which are planned for v1.1 and are NOT applied by this v1.0 release."
-    log "        They were ignored. See the spec 'Roadmap' section."
+csv_clean() { echo "$1" | tr -d '[:space:]'; }
+
+# -- DNS forwarders -- #
+configure_forwarders() {
+  [[ -z "$DNS_FORWARDERS" ]] && return 0
+  local fwd; fwd="$(csv_clean "$DNS_FORWARDERS")"
+  log "Configuring DNS forwarders: ${fwd} (${DNS_FORWARDER_PROTOCOL})..."
+  if api_call api/settings/set \
+        --data-urlencode "forwarders=${fwd}" \
+        --data-urlencode "forwarderProtocol=${DNS_FORWARDER_PROTOCOL}" | json_status_ok; then
+    log "  Forwarders set."
+  else
+    log "  WARNING: failed to set forwarders."
+  fi
+}
+
+# -- Primary zones + A records from ZONES_TEMPLATE -- #
+# Format: '# <zone>' headers; '<name> <ipv4>' records (relative label; '@' apex;
+# '*.x' wildcard; repeated name = round-robin). ';' lines and non-domain '#' lines
+# are comments.
+configure_zones_and_records() {
+  [[ -z "$ZONES_TEMPLATE" ]] && return 0
+  if [[ ! -f "$ZONES_TEMPLATE" ]]; then
+    log "WARNING: ZONES_TEMPLATE '$ZONES_TEMPLATE' not found; skipping zone creation."
+    return 0
+  fi
+  log "Creating zones + records from ${ZONES_TEMPLATE}..."
+  local zone="" line hdr name ip domain
+  local token_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"     # ltrim
+    line="${line%"${line##*[![:space:]]}"}"     # rtrim
+    [[ -z "$line" ]] && continue
+    [[ "${line:0:1}" == ";" ]] && continue
+    if [[ "${line:0:1}" == "#" ]]; then
+      hdr="${line#\#}"
+      hdr="${hdr#"${hdr%%[![:space:]]*}"}"; hdr="${hdr%"${hdr##*[![:space:]]}"}"
+      if [[ "$hdr" == *.* && "$hdr" =~ $token_re ]]; then
+        zone="$hdr"; zone_create "$zone"
+      fi
+      continue
+    fi
+    name="$(echo "$line" | awk '{print $1}')"
+    ip="$(echo "$line" | awk '{print $2}')"
+    if [[ -z "$zone" ]]; then
+      log "  WARNING: record '$line' before any '# <zone>' header; skipped."; continue
+    fi
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      log "  WARNING: '$line' is not '<name> <ipv4>'; skipped."; continue
+    fi
+    if [[ "$name" == "@" ]]; then domain="$zone"; else domain="${name}.${zone}"; fi
+    record_add_a "$domain" "$ip"
+  done < "$ZONES_TEMPLATE"
+}
+
+zone_create() {
+  local z="$1" resp
+  resp=$(api_call api/zones/create --data-urlencode "zone=${z}" --data-urlencode "type=Primary" 2>/dev/null || true)
+  if echo "$resp" | json_status_ok; then
+    log "  Zone created: $z"; CREATED_ZONES+=("$z")
+  elif echo "$resp" | grep -qiE 'already exists'; then
+    log "  Zone exists: $z (reusing)"; CREATED_ZONES+=("$z")
+  else
+    log "  WARNING: could not create zone '$z'."
+  fi
+}
+
+record_add_a() {
+  local domain="$1" ip="$2"
+  if api_call api/zones/records/add \
+        --data-urlencode "domain=${domain}" --data-urlencode "type=A" \
+        --data-urlencode "ipAddress=${ip}" --data-urlencode "ttl=${DNS_RECORD_TTL}" | json_status_ok; then
+    log "    A  ${domain} -> ${ip}"
+  else
+    log "    (skip) A ${domain} -> ${ip} (exists or invalid)"
+  fi
+}
+
+# -- DNSSEC: sign each primary zone created from the template -- #
+configure_dnssec() {
+  [[ "$ENABLE_DNSSEC" != "true" ]] && return 0
+  if (( ${#CREATED_ZONES[@]} == 0 )); then
+    log "ENABLE_DNSSEC=true but no template zones were created; nothing to sign."
+    return 0
+  fi
+  local z args
+  for z in "${CREATED_ZONES[@]}"; do
+    args=( --data-urlencode "zone=${z}" --data-urlencode "algorithm=${DNSSEC_ALGORITHM}" )
+    [[ "$DNSSEC_ALGORITHM" == "ECDSA" ]] && args+=( --data-urlencode "curve=${DNSSEC_CURVE}" )
+    if api_call api/zones/dnssec/sign "${args[@]}" | json_status_ok; then
+      log "  DNSSEC signed: $z (${DNSSEC_ALGORITHM}${DNSSEC_CURVE:+/$DNSSEC_CURVE})"
+    else
+      log "  WARNING: DNSSEC sign failed (or already signed) for $z."
+    fi
+  done
+}
+
+# -- DHCP scope -- #
+configure_dhcp() {
+  [[ "$ENABLE_DHCP" != "true" ]] && return 0
+  if [[ -z "$DHCP_START_ADDRESS" || -z "$DHCP_END_ADDRESS" ]]; then
+    log "WARNING: ENABLE_DHCP=true but DHCP_START_ADDRESS/DHCP_END_ADDRESS unset; skipping DHCP."
+    return 0
+  fi
+  log "Configuring DHCP scope '${DHCP_SCOPE_NAME}' (${DHCP_START_ADDRESS}-${DHCP_END_ADDRESS})..."
+  local args=(
+    --data-urlencode "name=${DHCP_SCOPE_NAME}"
+    --data-urlencode "startingAddress=${DHCP_START_ADDRESS}"
+    --data-urlencode "endingAddress=${DHCP_END_ADDRESS}"
+    --data-urlencode "subnetMask=${DHCP_SUBNET_MASK}"
+    --data-urlencode "leaseTimeDays=${DHCP_LEASE_DAYS}"
+    --data-urlencode "dnsUpdates=${DHCP_DNS_UPDATES}"
+  )
+  [[ -n "$DHCP_ROUTER" ]]      && args+=( --data-urlencode "routerAddress=${DHCP_ROUTER}" )
+  [[ -n "$DHCP_DOMAIN" ]]      && args+=( --data-urlencode "domainName=${DHCP_DOMAIN}" )
+  [[ -n "$DHCP_DNS_SEARCH" ]]  && args+=( --data-urlencode "domainSearchList=$(csv_clean "$DHCP_DNS_SEARCH")" )
+  [[ -n "$DHCP_NTP_SERVERS" ]] && args+=( --data-urlencode "ntpServers=$(csv_clean "$DHCP_NTP_SERVERS")" )
+  if [[ -n "$DHCP_DNS_SERVERS" ]]; then
+    args+=( --data-urlencode "useThisDnsServer=false" --data-urlencode "dnsServers=$(csv_clean "$DHCP_DNS_SERVERS")" )
+  else
+    args+=( --data-urlencode "useThisDnsServer=true" )
+  fi
+  if api_call api/dhcp/scopes/set "${args[@]}" | json_status_ok; then
+    log "  DHCP scope set."
+  else
+    log "  WARNING: failed to set DHCP scope '${DHCP_SCOPE_NAME}'."; return 0
+  fi
+  if [[ "$DHCP_SCOPE_ENABLED" == "true" ]]; then
+    if api_call api/dhcp/scopes/enable --data-urlencode "name=${DHCP_SCOPE_NAME}" | json_status_ok; then
+      log "  DHCP scope enabled."
+    else
+      log "  WARNING: could not enable scope (the server needs a NIC in the scope's subnet)."
+    fi
   fi
 }
 
@@ -535,7 +681,7 @@ run_install() {
   check_root_privileges
   os_check
   : > "$LOG_FILE"
-  log "# -- Technitium DNS Server Installer Started - $(date) -- #"
+  log "# -- Technitium DNS Server Installer v${SCRIPT_VERSION} Started - $(date) -- #"
   air_gap_check
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
     install_offline
