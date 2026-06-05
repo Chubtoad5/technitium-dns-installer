@@ -441,7 +441,10 @@ EOF
   cp "$base_dir/$SAVE_SENTINEL" "$b/"
 
   tar -czf "$base_dir/$SAVE_ARCHIVE" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL"
+  # The sentinel is preserved inside the archive; remove the loose copies from the
+  # build host so a later 'install' here is not mistaken for an air-gapped run.
   rm -rf "$b"
+  rm -f "$base_dir/$SAVE_SENTINEL"
   log ""
   log "Bundle ready: $base_dir/$SAVE_ARCHIVE"
   log "Transfer it to the air-gapped host, extract it ('tar -xzf $SAVE_ARCHIVE'),"
@@ -505,6 +508,8 @@ run_uninstall() {
   fi
 
   rm -rf "$dnsDir"
+  # Drop the now-empty /opt/technitium parent (upstream leaves it behind).
+  [[ "$dnsDir" == "$DNS_APP_DIR" ]] && rmdir /opt/technitium 2>/dev/null || true
 
   if [[ "$REMOVE_DOTNET" == "true" && -d "$DOTNET_DIR" ]]; then
     log "Removing .NET runtime ($DOTNET_DIR)..."
