@@ -1,0 +1,33 @@
+# Technitium DNS Server -- zone + record template
+#
+# RESERVED FOR v1.1. This file is shipped now so the format is stable, but the
+# installer does NOT yet read it (ZONES_TEMPLATE is ignored in v1.0).
+#
+# Format:
+#   - A line beginning with "#" that looks like a domain (contains a dot)
+#     declares the current PRIMARY zone. Every record line below it, until the
+#     next "# <zone>" header, is created inside that zone.
+#   - A record line is:   <name> <ipv4>
+#       <name> is the label relative to the current zone, so "record1" in zone
+#       "edge.lab" becomes the A record "record1.edge.lab".
+#       Use "@" for the zone apex, and "*.something" for a wildcard.
+#   - Repeating the same <name> with different IPs creates multiple A records
+#     for that name (round-robin / simple load balancing).
+#   - Blank lines are ignored. Use ";" at the start of a line for a real comment.
+#
+# Example (the values below are illustrative -- replace with your own):
+
+# edge.lab
+record1 192.168.1.50
+record2 192.168.1.54
+*.wildcard-record-example 192.168.1.111
+sub.domain.example 192.168.1.35
+
+# example.com
+record1 172.16.20.30
+record2 172.16.20.31
+*.wildcard-record-example 172.16.20.35
+sub.domain.example 172.16.20.22
+loadbalancer1 172.16.20.55
+loadbalancer1 172.16.20.56
+loadbalancer1 172.16.20.57
