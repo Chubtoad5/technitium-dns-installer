@@ -6,10 +6,10 @@ on a Linux host, following the conventions of the Chubtoad5 automation tool fami
 air-gapped installs replicate those steps from a saved bundle, and post-install configuration is
 driven through the Technitium HTTP API.
 
-This is **v1.0**, which covers install / upgrade / uninstall / air-gap `save`, initial admin password,
-web-console port, and optional self-signed HTTPS. Zone & record templating, DHCP scopes, DNS
-forwarders, and DNSSEC signing are planned for **v1.1** (the environment variables for them are already
-defined for a stable contract, but are ignored in v1.0 — the installer prints a notice if you set them).
+**v1.1** covers install / upgrade / uninstall / air-gap `save`, initial admin password, web-console port,
+optional self-signed HTTPS, **plus** optional post-install configuration via the Technitium HTTP API:
+primary zones + A records from a template, DNS forwarders, DNSSEC signing, and a DHCP scope. Every
+configuration block is off/empty by default — the installer only touches what you ask it to.
 
 ---
 
@@ -17,12 +17,13 @@ defined for a stable contract, but are ignored in v1.0 — the installer prints 
 
 - [Quick Start](#quick-start)
 - [Commands](#commands)
-- [Environment Variables (v1.0)](#environment-variables-v10)
+- [Core Environment Variables](#core-environment-variables)
+- [DNS Configuration (zones, forwarders, DNSSEC, DHCP)](#dns-configuration-zones-forwarders-dnssec-dhcp)
 - [Air-Gapped Install](#air-gapped-install)
 - [Upgrade](#upgrade)
 - [Uninstall](#uninstall)
 - [What it changes on the host](#what-it-changes-on-the-host)
-- [Roadmap (v1.1)](#roadmap-v11)
+- [Roadmap](#roadmap)
 
 ---
 
@@ -65,7 +66,7 @@ sudo DNS_ADMIN_PASSWORD='ChangeMe123!' \
 
 ---
 
-## Environment Variables (v1.0)
+## Core Environment Variables
 
 All variables are overridden at runtime, e.g. `sudo VAR=value ./technitium_dns_installer.sh install`.
 
@@ -83,6 +84,72 @@ All variables are overridden at runtime, e.g. `sudo VAR=value ./technitium_dns_i
 
 **Source/version override knobs** (rarely needed): `TECHNITIUM_INSTALL_URL`, `TECHNITIUM_UNINSTALL_URL`,
 `TECHNITIUM_PACKAGE_URL`, `DOTNET_INSTALL_URL`, `DOTNET_VERSION`, `INSTALL_PACKAGES_URL`.
+
+---
+
+## DNS Configuration (zones, forwarders, DNSSEC, DHCP)
+
+All of these are optional and applied through the Technitium HTTP API after the server is up. Leave them at
+their defaults to skip a block entirely.
+
+### Primary zones + A records
+
+Point `ZONES_TEMPLATE` at a file in the [`zones.template.txt`](zones.template.txt) format: `# <zone>` headers,
+then `<name> <ipv4>` lines (label relative to the zone; `@` = apex; `*.x` = wildcard; the same name repeated =
+round-robin). Each zone is created as a **Primary** zone; missing zones are created, existing ones reused.
+
+```bash
+sudo DNS_ADMIN_PASSWORD='S3cret!' ZONES_TEMPLATE=./zones.txt ./technitium_dns_installer.sh install
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `ZONES_TEMPLATE` | – | Path to the zone/record template. |
+| `DNS_RECORD_TTL` | `3600` | TTL for A records created from the template. |
+
+### DNS forwarders
+
+| Variable | Default | Description |
+|---|---|---|
+| `DNS_FORWARDERS` | – | Comma list of upstreams, e.g. `1.1.1.1, 8.8.8.8`. Empty = root-hint recursion. |
+| `DNS_FORWARDER_PROTOCOL` | `Udp` | `Udp` / `Tcp` / `Tls` / `Https`. |
+
+### DNSSEC
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_DNSSEC` | `false` | Sign every primary zone created from `ZONES_TEMPLATE`. |
+| `DNSSEC_ALGORITHM` | `ECDSA` | `ECDSA` / `RSA` / `EDDSA`. |
+| `DNSSEC_CURVE` | `P256` | For ECDSA: `P256` / `P384`. |
+
+### DHCP scope
+
+Set `ENABLE_DHCP=true` plus at least the start/end addresses. The scope advertises this DNS server unless you
+override `DHCP_DNS_SERVERS`. Enabling the scope requires the server to have a NIC in the scope's subnet (otherwise
+the scope is created but stays disabled with a warning).
+
+```bash
+sudo ENABLE_DHCP=true DHCP_SCOPE_NAME=lan \
+     DHCP_START_ADDRESS=10.20.0.100 DHCP_END_ADDRESS=10.20.0.200 \
+     DHCP_SUBNET_MASK=255.255.255.0 DHCP_ROUTER=10.20.0.1 \
+     DHCP_DOMAIN=lan.example DHCP_DNS_SEARCH='lan.example' \
+     DHCP_NTP_SERVERS='10.20.0.1' ./technitium_dns_installer.sh install
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_DHCP` | `false` | Create + (optionally) enable a DHCP scope. |
+| `DHCP_SCOPE_NAME` | `Default` | Scope name. |
+| `DHCP_START_ADDRESS` / `DHCP_END_ADDRESS` | – (required) | Address pool bounds. |
+| `DHCP_SUBNET_MASK` | `255.255.255.0` | Subnet mask. |
+| `DHCP_ROUTER` | – | Default gateway advertised to clients. |
+| `DHCP_DNS_SERVERS` | – | Comma list; empty = advertise this DNS server. |
+| `DHCP_DOMAIN` | – | Domain name option. |
+| `DHCP_DNS_SEARCH` | – | Comma list → DNS search list. |
+| `DHCP_NTP_SERVERS` | – | Comma list → NTP servers. |
+| `DHCP_DNS_UPDATES` | `true` | Enable dynamic DNS updates from leases. |
+| `DHCP_LEASE_DAYS` | `1` | Lease time (days). |
+| `DHCP_SCOPE_ENABLED` | `true` | Enable the scope after creating it. |
 
 ---
 
@@ -145,12 +212,8 @@ Unlike the upstream interactive uninstaller, this is non-interactive and control
 
 ---
 
-## Roadmap (v1.1)
+## Roadmap
 
-The following are planned and their environment variables are already reserved (defined but inert in v1.0):
-
-- **Primary zones + A records** from a template file (`ZONES_TEMPLATE`). See [`zones.template.txt`](zones.template.txt) for the format.
-- **DNS forwarders** (`DNS_FORWARDERS`, `DNS_FORWARDER_PROTOCOL`).
-- **DNSSEC** signing of created zones (`ENABLE_DNSSEC`).
-- **DHCP scope** creation + enable with domain name, DNS search list, DNS updates, router, and NTP
-  (`ENABLE_DHCP`, `DHCP_*`).
+Shipped in v1.1: zones/records templating, forwarders, DNSSEC, and DHCP scopes (above). Possible future work:
+reverse (PTR) zones from the template, secondary/stub/conditional-forwarder zones, additional record types
+(CNAME/MX/TXT), DHCP reservations, and a dedicated `configure` subcommand to re-apply config without reinstalling.

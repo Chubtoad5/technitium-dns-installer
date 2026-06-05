@@ -1,7 +1,6 @@
 # Technitium DNS Server -- zone + record template
 #
-# RESERVED FOR v1.1. This file is shipped now so the format is stable, but the
-# installer does NOT yet read it (ZONES_TEMPLATE is ignored in v1.0).
+# Point the installer at a copy of this file:  ZONES_TEMPLATE=./zones.txt ./technitium_dns_installer.sh install
 #
 # Format:
 #   - A line beginning with "#" that looks like a domain (contains a dot)
