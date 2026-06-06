@@ -230,3 +230,8 @@ authoritative + recursive DNS server by Technitium. All credit for the DNS serve
 - HTTP API documentation — <https://github.com/TechnitiumSoftware/DnsServer/blob/master/APIDOCS.md>
 - Technitium DNS Server source — <https://github.com/TechnitiumSoftware/DnsServer>
 - Support the upstream project (Patreon) — <https://www.patreon.com/technitium>
+
+## License
+
+Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). (This installer is an
+independent work that orchestrates Technitium DNS Server; the bundled Technitium binary remains GPL-3.0 — see NOTICE.)

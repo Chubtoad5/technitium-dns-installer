@@ -1,0 +1,23 @@
+Technitium DNS Server Installer
+Copyright (C) 2026 Chubtoad5
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is an original automation script. It installs and configures the following
+third-party software, each under its own license (all credit to their respective
+authors):
+
+  Technitium DNS Server   GPL-3.0      https://github.com/TechnitiumSoftware/DnsServer
+  .NET / ASP.NET Core runtime (Linux)  MIT   https://github.com/dotnet/runtime
+
+The `save` mode builds an air-gap bundle that redistributes the Technitium DNS
+Server binary (`DnsServerPortable.tar.gz`), which is **GPL-3.0**. When you
+distribute that bundle you must retain Technitium's license text and provide the
+corresponding source or a written offer per the GPL; the upstream source is at
+https://github.com/TechnitiumSoftware/DnsServer . (GPL-3.0 has no AGPL-style
+network clause, so running the server as a service does not by itself trigger a
+source-disclosure obligation.) The bundled .NET runtime is MIT — retain its
+LICENSE.txt and ThirdPartyNotices.txt.
+
+This installer is an independent work that orchestrates Technitium DNS Server; it
+is not affiliated with or endorsed by Technitium.
