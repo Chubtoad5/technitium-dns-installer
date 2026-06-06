@@ -30,6 +30,9 @@ DOTNET_INSTALL_URL=${DOTNET_INSTALL_URL:-"https://dot.net/v1/dotnet-install.sh"}
 DOTNET_VERSION=${DOTNET_VERSION:-"10.0"}
 INSTALL_PACKAGES_URL=${INSTALL_PACKAGES_URL:-"https://raw.githubusercontent.com/Chubtoad5/install-packages/main/install_packages.sh"}
 
+# -- Licensing (air-gap bundle GPL/AGPL source-offer contact) -- #
+LICENSE_OFFER_CONTACT=${LICENSE_OFFER_CONTACT:-"the Chubtoad5 project via https://github.com/Chubtoad5"}
+
 # -- Admin user / credentials -- #
 DNS_ADMIN_USER=${DNS_ADMIN_USER:-"admin"}        # built-in admin account (rename not supported in v1.0)
 DNS_ADMIN_PASSWORD=${DNS_ADMIN_PASSWORD:-"changeme"}
@@ -539,6 +542,55 @@ configure_dhcp() {
   fi
 }
 
+# Drop a LICENSES/ directory into the air-gap bundle: a version-pinned third-party
+# manifest plus a GPLv3-compliant written offer for the bundled copyleft component
+# (Technitium DNS Server, GPL-3.0). This satisfies the GPL requirement to accompany
+# a redistributed binary with the corresponding source OR a written offer for it.
+# ($icu is a local of run_save; visible here via bash dynamic scope.)
+generate_bundle_licenses() {
+  local b="$1"
+  mkdir -p "$b/LICENSES"
+  cat > "$b/LICENSES/THIRD_PARTY_NOTICES.txt" << EOF
+Third-party components redistributed in this Technitium DNS air-gap bundle
+Generated: $(date)
+
+Component                         License      Upstream source
+--------------------------------  -----------  ---------------------------------------------
+Technitium DNS Server (binary)    GPL-3.0      https://github.com/TechnitiumSoftware/DnsServer
+  DnsServerPortable.tar.gz from ${TECHNITIUM_PACKAGE_URL}
+.NET / ASP.NET Core ${DOTNET_VERSION} runtime    MIT          https://github.com/dotnet/runtime
+  (LICENSE.txt + ThirdPartyNotices.txt ship inside dotnet-runtime.tar.gz)
+libicu (${icu})                   Unicode/ICU  your OS distribution
+technitium_dns_installer.sh,
+install_packages.sh               Apache-2.0   https://github.com/Chubtoad5
+
+The copyleft component (Technitium DNS Server, GPL-3.0) is covered by WRITTEN_OFFER.txt.
+All others are permissive; their copyright/license notices are retained with the artifact.
+EOF
+  cat > "$b/LICENSES/WRITTEN_OFFER.txt" << EOF
+WRITTEN OFFER FOR CORRESPONDING SOURCE CODE (GPL-3.0)
+
+This air-gap bundle redistributes Technitium DNS Server in binary form
+(DnsServerPortable.tar.gz). Technitium DNS Server is licensed under the GNU
+General Public License, version 3.
+
+In accordance with GPLv3 section 6, the distributor of this bundle hereby makes a
+written offer, valid for three (3) years from the date this bundle was created
+($(date +%Y-%m-%d)), to give any third party who possesses this bundle a complete
+machine-readable copy of the corresponding source code, for a charge no more than
+the cost of physically performing the source distribution.
+
+The corresponding source is also publicly available from the upstream project at:
+    https://github.com/TechnitiumSoftware/DnsServer
+
+To request the source on a physical medium, contact: ${LICENSE_OFFER_CONTACT}
+
+This offer is extended by whoever distributes this bundle, and is independent of
+the Apache-2.0 license that covers the installer scripts themselves.
+EOF
+  log "  Wrote LICENSES/ (third-party manifest + GPL written offer for Technitium DNS)."
+}
+
 # ============================================================================ #
 # -- save (build the air-gap bundle) --                                        #
 # ============================================================================ #
@@ -580,11 +632,15 @@ run_save() {
 # DNS package:    ${TECHNITIUM_PACKAGE_URL}
 # .NET runtime:   ASP.NET Core ${DOTNET_VERSION}
 # ICU package:    ${icu}
+# Licenses:       see LICENSES/ (third-party manifest + GPL source offer)
 #
 # NOTE: this bundle is OS-family / architecture specific. Build it on the same
 # distro family and CPU arch as the air-gapped target.
 EOF
   cp "$base_dir/$SAVE_SENTINEL" "$b/"
+
+  # 6. LICENSES/ — third-party manifest + GPL written offer (compliance)
+  generate_bundle_licenses "$b"
 
   tar -czf "$base_dir/$SAVE_ARCHIVE" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL"
   # The sentinel is preserved inside the archive; remove the loose copies from the
