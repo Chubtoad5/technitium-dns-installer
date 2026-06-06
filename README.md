@@ -174,6 +174,10 @@ entirely offline — extracting the bundled ASP.NET Core runtime and DNS package
 
 > The bundle is **OS-family / architecture specific**. Build it on a host matching the target.
 
+The bundle includes a `LICENSES/` directory: a third-party component manifest plus a GPL-3.0 **written offer** for
+the redistributed Technitium DNS Server binary (Technitium is GPL-3.0; the installer scripts are Apache-2.0). Set
+`LICENSE_OFFER_CONTACT` to override the contact named in that offer.
+
 ---
 
 ## Upgrade
