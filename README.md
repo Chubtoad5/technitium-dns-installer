@@ -217,3 +217,16 @@ Unlike the upstream interactive uninstaller, this is non-interactive and control
 Shipped in v1.1: zones/records templating, forwarders, DNSSEC, and DHCP scopes (above). Possible future work:
 reverse (PTR) zones from the template, secondary/stub/conditional-forwarder zones, additional record types
 (CNAME/MX/TXT), DHCP reservations, and a dedicated `configure` subcommand to re-apply config without reinstalling.
+
+---
+
+## References
+
+This installer wraps and configures [Technitium DNS Server](https://technitium.com/dns/), an open-source
+authoritative + recursive DNS server by Technitium. All credit for the DNS server itself goes to its authors.
+
+- Technitium DNS Server — <https://technitium.com/dns/>
+- Running DNS Server on Ubuntu Linux (install + manual setup) — <https://blog.technitium.com/2017/11/running-dns-server-on-ubuntu-linux.html>
+- HTTP API documentation — <https://github.com/TechnitiumSoftware/DnsServer/blob/master/APIDOCS.md>
+- Technitium DNS Server source — <https://github.com/TechnitiumSoftware/DnsServer>
+- Support the upstream project (Patreon) — <https://www.patreon.com/technitium>
