@@ -39,6 +39,9 @@ LICENSE_OFFER_CONTACT=${LICENSE_OFFER_CONTACT:-"the Chubtoad5 project via https:
 # -- Admin user / credentials -- #
 DNS_ADMIN_USER=${DNS_ADMIN_USER:-"admin"}        # built-in admin account (rename not supported in v1.0)
 DNS_ADMIN_PASSWORD=${DNS_ADMIN_PASSWORD:-"changeme"}
+# Password rotation: when re-running with a NEW DNS_ADMIN_PASSWORD, pass the
+# previous one here so the installer can authenticate and rotate it (TD-11).
+DNS_ADMIN_CURRENT_PASSWORD=${DNS_ADMIN_CURRENT_PASSWORD:-""}
 
 # -- Web console (DNS management) -- #
 DNS_WEB_PORT=${DNS_WEB_PORT:-"5380"}             # upstream default is 5380
@@ -138,6 +141,8 @@ Commands:
 
 Core environment overrides (see README.md for the full list):
   DNS_ADMIN_PASSWORD   Admin password to set (default: changeme)
+  DNS_ADMIN_CURRENT_PASSWORD
+                       Current password when rotating to a new DNS_ADMIN_PASSWORD
   DNS_WEB_PORT         Web console HTTP port (default: 5380)
   ENABLE_HTTPS         Serve the console over HTTPS self-signed (default: false)
   DNS_HTTPS_PORT       HTTPS port when ENABLE_HTTPS=true (default: 53443)
@@ -387,6 +392,18 @@ wait_for_webservice() {
 
 json_field()     { grep -oP "\"$1\"\s*:\s*\"\K[^\"]+" | head -n1; }
 json_status_ok() { grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; }
+# Extract the IPv4 addresses of type-A records from a zones/records/get response.
+json_a_record_ips() { grep -oP '"type"\s*:\s*"A"[^{]*\{\s*"ipAddress"\s*:\s*"\K[0-9.]+' || true; }
+
+# Write a secret to a root-only temp file for curl's --data-urlencode name@file
+# form, keeping credentials off the process argv (TD-7). Caller must rm -f it.
+secret_tmp_file() {
+  local f
+  f="$(mktemp)"
+  chmod 600 "$f"
+  printf '%s' "$1" > "$f"
+  echo "$f"
+}
 
 # api_call <endpoint> [--data-urlencode k=v ...]
 # POST to the API with the session token added. All caller-supplied values must be
@@ -397,27 +414,60 @@ api_call() {
   curl -fsSk "${API_BASE}/${endpoint}" --data-urlencode "token=${API_TOKEN}" "$@"
 }
 
-# Log in (handles both first-run admin/admin and an already-changed password),
-# then ensure the password equals DNS_ADMIN_PASSWORD. Idempotent.
+# Log in and ensure the admin password equals DNS_ADMIN_PASSWORD. Idempotent.
+# Tries, in order: the desired password (re-runs), DNS_ADMIN_CURRENT_PASSWORD
+# (rotation, TD-11), and the factory default admin/admin (first install).
+# Passwords travel via 600-perm temp files, never on curl's argv (TD-7).
 api_login_and_set_password() {
-  local resp
+  local resp pw_file cur_file
+  pw_file="$(secret_tmp_file "$DNS_ADMIN_PASSWORD")"
+
   # 1. Try the desired password first (idempotent re-runs).
   resp=$(curl -fsSk "${API_BASE}/api/user/login" \
             --data-urlencode "user=${DNS_ADMIN_USER}" \
-            --data-urlencode "pass=${DNS_ADMIN_PASSWORD}" \
+            --data-urlencode "pass@${pw_file}" \
             --data-urlencode "includeInfo=true" || true)
   if echo "$resp" | json_status_ok; then
     API_TOKEN=$(echo "$resp" | json_field token)
+    rm -f "$pw_file"
     log "Authenticated as ${DNS_ADMIN_USER} (password already set)."
     return 0
   fi
-  # 2. Fall back to the factory default admin/admin and change the password.
+
+  # 2. Rotation: authenticate with the previous password, then set the new one.
+  if [[ -n "$DNS_ADMIN_CURRENT_PASSWORD" ]]; then
+    cur_file="$(secret_tmp_file "$DNS_ADMIN_CURRENT_PASSWORD")"
+    resp=$(curl -fsSk "${API_BASE}/api/user/login" \
+              --data-urlencode "user=${DNS_ADMIN_USER}" \
+              --data-urlencode "pass@${cur_file}" \
+              --data-urlencode "includeInfo=true" || true)
+    if echo "$resp" | json_status_ok; then
+      API_TOKEN=$(echo "$resp" | json_field token)
+      log "Authenticated with DNS_ADMIN_CURRENT_PASSWORD; rotating the admin password..."
+      if api_call api/user/changePassword \
+            --data-urlencode "pass@${cur_file}" \
+            --data-urlencode "newPass@${pw_file}" | json_status_ok; then
+        log "Admin password rotated."
+        rm -f "$pw_file" "$cur_file"
+        return 0
+      fi
+      rm -f "$pw_file" "$cur_file"
+      log "ERROR: authenticated with DNS_ADMIN_CURRENT_PASSWORD but failed to set the new password."
+      exit 1
+    fi
+    rm -f "$cur_file"
+  fi
+
+  # 3. Fall back to the factory default admin/admin and change the password.
   resp=$(curl -fsSk "${API_BASE}/api/user/login" \
             --data-urlencode "user=admin" \
             --data-urlencode "pass=admin" \
             --data-urlencode "includeInfo=true" || true)
   if ! echo "$resp" | json_status_ok; then
-    log "ERROR: could not authenticate with the configured or factory-default credentials."
+    rm -f "$pw_file"
+    log "ERROR: could not authenticate with the configured, rotation (DNS_ADMIN_CURRENT_PASSWORD), or factory-default credentials."
+    log "       If the admin password was changed earlier (e.g. a previous run used a different DNS_ADMIN_PASSWORD),"
+    log "       re-run with: DNS_ADMIN_CURRENT_PASSWORD='<old password>' DNS_ADMIN_PASSWORD='<new password>'"
     exit 1
   fi
   API_TOKEN=$(echo "$resp" | json_field token)
@@ -425,9 +475,11 @@ api_login_and_set_password() {
   # changePassword requires BOTH the current password (pass) and the new one (newPass).
   if api_call api/user/changePassword \
         --data-urlencode "pass=admin" \
-        --data-urlencode "newPass=${DNS_ADMIN_PASSWORD}" | json_status_ok; then
+        --data-urlencode "newPass@${pw_file}" | json_status_ok; then
     log "Admin password updated."
+    rm -f "$pw_file"
   else
+    rm -f "$pw_file"
     log "ERROR: failed to change the admin password."
     exit 1
   fi
@@ -487,6 +539,11 @@ configure_forwarders() {
 # Format: '# <zone>' headers; '<name> <ipv4>' records (relative label; '@' apex;
 # '*.x' wildcard; repeated name = round-robin). ';' lines and non-domain '#' lines
 # are comments.
+#
+# Convergence (TD-10): for every name that appears in the template, the A-record
+# set is made to EQUAL the template (stale IPs at that name are removed, so a
+# changed address does not become accidental round-robin with a dead IP).
+# Names NOT mentioned in the template are never touched (additive semantics).
 configure_zones_and_records() {
   [[ -z "$ZONES_TEMPLATE" ]] && return 0
   if [[ ! -f "$ZONES_TEMPLATE" ]]; then
@@ -496,6 +553,10 @@ configure_zones_and_records() {
   log "Creating zones + records from ${ZONES_TEMPLATE}..."
   local zone="" line hdr name ip domain
   local token_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+  # Pass 1: parse the template, create zones as headers are encountered, and
+  # collect the full desired A-record set per name.
+  local -a rec_domains=()
+  local -A rec_zone=() rec_ips=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"     # ltrim
@@ -519,8 +580,20 @@ configure_zones_and_records() {
       log "  WARNING: '$line' is not '<name> <ipv4>'; skipped."; continue
     fi
     if [[ "$name" == "@" ]]; then domain="$zone"; else domain="${name}.${zone}"; fi
-    record_add_a "$domain" "$ip"
+    if [[ -z "${rec_ips[$domain]:-}" ]]; then
+      rec_domains+=("$domain")
+      rec_zone[$domain]="$zone"
+      rec_ips[$domain]="$ip"
+    elif [[ " ${rec_ips[$domain]} " != *" $ip "* ]]; then
+      rec_ips[$domain]="${rec_ips[$domain]} $ip"
+    fi
   done < "$ZONES_TEMPLATE"
+  # Pass 2: converge each name's A-record set to the template.
+  local d
+  for d in "${rec_domains[@]}"; do
+    # shellcheck disable=SC2086
+    record_sync_a "${rec_zone[$d]}" "$d" ${rec_ips[$d]}
+  done
 }
 
 zone_create() {
@@ -533,6 +606,41 @@ zone_create() {
   else
     log "  WARNING: could not create zone '$z'."
   fi
+}
+
+# Converge the A-record set for one name (TD-10): remove A records at this name
+# that are not in the desired set, then add the missing ones.
+record_sync_a() {
+  local zone="$1" domain="$2"; shift 2
+  local -a desired=("$@") existing=()
+  local ip d keep
+  mapfile -t existing < <(api_call api/zones/records/get \
+        --data-urlencode "domain=${domain}" \
+        --data-urlencode "zone=${zone}" 2>/dev/null | json_a_record_ips)
+  for ip in "${existing[@]}"; do
+    keep=0
+    for d in "${desired[@]}"; do [[ "$ip" == "$d" ]] && { keep=1; break; }; done
+    if (( ! keep )); then
+      if api_call api/zones/records/delete \
+            --data-urlencode "domain=${domain}" \
+            --data-urlencode "zone=${zone}" \
+            --data-urlencode "type=A" \
+            --data-urlencode "ipAddress=${ip}" | json_status_ok; then
+        log "    A  ${domain} -x ${ip} (removed - not in template)"
+      else
+        log "    WARNING: could not remove stale A ${domain} -> ${ip}"
+      fi
+    fi
+  done
+  for ip in "${desired[@]}"; do
+    keep=0
+    for d in "${existing[@]}"; do [[ "$ip" == "$d" ]] && { keep=1; break; }; done
+    if (( keep )); then
+      log "    A  ${domain} -> ${ip} (exists)"
+    else
+      record_add_a "$domain" "$ip"
+    fi
+  done
 }
 
 record_add_a() {
@@ -847,7 +955,11 @@ run_install() {
   fi
   log "  Web console : http://$(hostname -I | awk '{print $1}'):${DNS_WEB_PORT}/"
   log "  Username    : ${DNS_ADMIN_USER}"
-  log "  Password    : ${DNS_ADMIN_PASSWORD}"
+  if [[ "$DNS_ADMIN_PASSWORD" == "changeme" ]]; then
+    log "  Password    : the default 'changeme' - CHANGE IT (set DNS_ADMIN_PASSWORD)"
+  else
+    log "  Password    : (set from DNS_ADMIN_PASSWORD - not logged)"
+  fi
   log "================================================================"
 }
 
