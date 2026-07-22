@@ -14,8 +14,11 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="1.1.0"
-base_dir=$(pwd)
+SCRIPT_VERSION="1.2.0"
+# Anchor to the script's own directory (TD-6): the air-gap bundle/sentinel are
+# expected next to the script. air_gap_check keeps a compat fallback to $PWD.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+base_dir="$script_dir"
 
 # ============================================================================ #
 # -- USER DEFINED Configuration Variables (override at runtime) --             #
@@ -44,6 +47,7 @@ DNS_HTTPS_PORT=${DNS_HTTPS_PORT:-"53443"}        # only used when ENABLE_HTTPS=t
 
 # -- Host integration -- #
 DISABLE_SYSTEMD_RESOLVED=${DISABLE_SYSTEMD_RESOLVED:-"true"}  # mirrors upstream install.sh behaviour
+FORCE_ONLINE=${FORCE_ONLINE:-"false"}            # ignore an air-gap sentinel and install online (TD-17)
 
 # -- Uninstall behaviour -- #
 PURGE_DATA=${PURGE_DATA:-"false"}                # also remove /etc/dns (all zones/config) on uninstall
@@ -110,6 +114,9 @@ API_BASE=""           # resolved by wait_for_webservice (http://127.0.0.1:<port>
 # ============================================================================ #
 log()  { echo "$*" | tee -a "$LOG_FILE"; }
 
+# Create/append the log with restrictive perms (it captures full command output).
+init_log() { : >> "$LOG_FILE"; chmod 600 "$LOG_FILE" 2>/dev/null || true; }
+
 usage() {
   cat << EOF
 Technitium DNS Server Installer v$SCRIPT_VERSION
@@ -134,6 +141,7 @@ Core environment overrides (see README.md for the full list):
   DNS_WEB_PORT         Web console HTTP port (default: 5380)
   ENABLE_HTTPS         Serve the console over HTTPS self-signed (default: false)
   DNS_HTTPS_PORT       HTTPS port when ENABLE_HTTPS=true (default: 53443)
+  FORCE_ONLINE         Ignore an air-gap bundle and install online (default: false)
   PURGE_DATA           uninstall also removes $DNS_CONFIG_DIR (default: false)
   REMOVE_DOTNET        uninstall also removes $DOTNET_DIR (default: false)
 
@@ -187,6 +195,25 @@ os_check() {
   fi
 }
 
+# Fail early with distro-specific hints when a required tool is missing —
+# minimal cloud images often ship without curl (TD-15).
+preflight_dependencies() {
+  local -a required=(curl tar grep sed awk)
+  local -a missing=()
+  local c
+  for c in "${required[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+  echo "ERROR: missing required command(s): ${missing[*]}"
+  case "${OS_ID:-}" in
+    ubuntu|debian)                          echo "  Install with: sudo apt-get update && sudo apt-get install -y ${missing[*]}" ;;
+    rhel|centos|rocky|almalinux|fedora)     echo "  Install with: sudo dnf install -y ${missing[*]}" ;;
+    sles|opensuse-leap|opensuse-tumbleweed) echo "  Install with: sudo zypper -n install ${missing[*]}" ;;
+  esac
+  exit 1
+}
+
 # Resolve the best-available libicu package name for the running distro.
 icu_package_name() {
   case "$OS_ID" in
@@ -195,15 +222,50 @@ icu_package_name() {
       elif apt-cache show libicu72 >/dev/null 2>&1; then echo "libicu72"
       elif apt-cache show libicu70 >/dev/null 2>&1; then echo "libicu70"
       else echo "libicu-dev"; fi ;;
-    *) echo "libicu" ;;   # dnf/yum/zypper all ship a 'libicu' package
+    sles|opensuse-leap|opensuse-tumbleweed)
+      # SUSE names the ICU runtime by soname (libicu73_2, libicu76_1, ...);
+      # plain 'libicu' has no provider on Leap 16 (TD-9). Prefer an already
+      # installed package, then the newest zypper-resolvable candidate.
+      local icu_pkg=""
+      icu_pkg="$(rpm -qa --qf '%{NAME}\n' 2>/dev/null \
+                   | grep -E '^libicu[0-9]+(_[0-9]+)*$' | sort -V | tail -n1 || true)"
+      if [[ -z "$icu_pkg" ]]; then
+        icu_pkg="$(zypper --non-interactive search -t package 'libicu*' 2>/dev/null \
+                     | awk -F'|' 'NF>=3 {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' \
+                     | grep -E '^libicu[0-9]+(_[0-9]+)*$' | sort -V | tail -n1 || true)"
+      fi
+      if [[ -n "$icu_pkg" ]]; then echo "$icu_pkg"; else echo "libicu"; fi ;;
+    *) echo "libicu" ;;   # dnf/yum ship a 'libicu' package
   esac
 }
 
+# Detect an air-gap bundle next to the script (TD-6), with a compat fallback to
+# the current working directory. A sentinel without a usable bundle is treated
+# as stale and reported instead of silently flipping install modes (TD-17).
 air_gap_check() {
-  if [[ -f "$base_dir/$SAVE_SENTINEL" ]]; then
-    AIR_GAPPED_MODE=1
-    log "Air-gap bundle detected ($SAVE_SENTINEL) -> offline install."
+  if [[ "$FORCE_ONLINE" == "true" ]]; then
+    log "FORCE_ONLINE=true -> ignoring any air-gap bundle; using the online path."
+    return 0
   fi
+  local -a candidates=("$script_dir")
+  [[ "$PWD" != "$script_dir" ]] && candidates+=("$PWD")
+  local d
+  for d in "${candidates[@]}"; do
+    [[ -f "$d/$SAVE_SENTINEL" ]] || continue
+    if [[ -f "$d/$BUNDLE_DIR/DnsServerPortable.tar.gz" ]]; then
+      AIR_GAPPED_MODE=1
+      base_dir="$d"
+      if [[ "$d" != "$script_dir" ]]; then
+        log "NOTE: air-gap bundle found in the current directory ($d), not next to the script; using it (compat fallback)."
+      fi
+      log "Air-gap bundle detected ($SAVE_SENTINEL) -> offline install."
+      return 0
+    fi
+    log "WARNING: found '$d/$SAVE_SENTINEL' but no usable bundle ('$BUNDLE_DIR/DnsServerPortable.tar.gz' missing) - stale sentinel?"
+    log "         Continuing with an ONLINE install. Remove the stale sentinel or re-extract the full $SAVE_ARCHIVE for an offline install."
+  done
+  log "No air-gap bundle found -> online install."
+  return 0
 }
 
 require_internet_artifact() {
@@ -594,8 +656,28 @@ EOF
 # ============================================================================ #
 # -- save (build the air-gap bundle) --                                        #
 # ============================================================================ #
+
+# A failed save must not leave a loose sentinel behind: it would flip the next
+# 'install' on this host into air-gap mode (TD-17), and a partial archive could
+# be mistaken for a good one (W4).
+on_save_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )); then
+    log "ERROR: save did not complete (exit $rc); cleaning up partial artifacts."
+    rm -rf "${base_dir:?}/$BUNDLE_DIR"
+    rm -f "$base_dir/$SAVE_SENTINEL" "$base_dir/$SAVE_ARCHIVE.partial"
+  fi
+  exit "$rc"
+}
+
 run_save() {
+  check_root_privileges          # install-packages 'save' needs root (TD-16)
+  os_check
+  preflight_dependencies
+  init_log
   log "# -- Building Technitium air-gap bundle - $(date) -- #"
+  trap on_save_exit EXIT
   local b="$base_dir/$BUNDLE_DIR"
   rm -rf "$b"; mkdir -p "$b/utilities"
 
@@ -624,7 +706,8 @@ run_save() {
   ( cd "$b/utilities" && debug_run ./install_packages.sh save "$icu" )
 
   # 5. The installer itself + sentinel/manifest
-  cp "$base_dir/$SCRIPT_NAME" "$b/"
+  cp "$script_dir/$SCRIPT_NAME" "$b/"
+  chmod +x "$b/$SCRIPT_NAME"
   cat > "$base_dir/$SAVE_SENTINEL" << EOF
 # Technitium DNS Server Installer - air-gap bundle manifest
 # Created:        $(date)
@@ -642,11 +725,17 @@ EOF
   # 6. LICENSES/ — third-party manifest + GPL written offer (compliance)
   generate_bundle_licenses "$b"
 
-  tar -czf "$base_dir/$SAVE_ARCHIVE" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL"
+  # The installer + sentinel sit at the TOP level of the archive so the documented
+  # flow ('tar -xzf ...; sudo ./technitium_dns_installer.sh install') works
+  # verbatim (TD-5). The copies inside $BUNDLE_DIR are kept for compatibility.
+  # Build atomically: write to a temp name, then move into place (W4).
+  tar -czf "$base_dir/$SAVE_ARCHIVE.partial" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL" "$SCRIPT_NAME"
+  mv -f "$base_dir/$SAVE_ARCHIVE.partial" "$base_dir/$SAVE_ARCHIVE"
   # The sentinel is preserved inside the archive; remove the loose copies from the
   # build host so a later 'install' here is not mistaken for an air-gapped run.
   rm -rf "$b"
   rm -f "$base_dir/$SAVE_SENTINEL"
+  trap - EXIT
   log ""
   log "Bundle ready: $base_dir/$SAVE_ARCHIVE"
   log "Transfer it to the air-gapped host, extract it ('tar -xzf $SAVE_ARCHIVE'),"
@@ -659,6 +748,8 @@ EOF
 run_upgrade() {
   check_root_privileges
   os_check
+  preflight_dependencies
+  init_log
   if [[ ! -f "$SYSTEMD_UNIT" ]]; then
     log "ERROR: no existing dns.service found. Run 'install' first."
     exit 1
@@ -736,7 +827,9 @@ run_uninstall() {
 run_install() {
   check_root_privileges
   os_check
+  preflight_dependencies
   : > "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
   log "# -- Technitium DNS Server Installer v${SCRIPT_VERSION} Started - $(date) -- #"
   air_gap_check
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
@@ -773,7 +866,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$SAVE_MODE" -eq 1 ]];      then os_check; : > "$LOG_FILE"; run_save; fi
+if [[ "$SAVE_MODE" -eq 1 ]];      then run_save; fi
 if [[ "$UPGRADE_MODE" -eq 1 ]];   then run_upgrade; fi
 if [[ "$UNINSTALL_MODE" -eq 1 ]]; then run_uninstall; fi
 if [[ "$INSTALL_MODE" -eq 1 ]];   then run_install; fi
