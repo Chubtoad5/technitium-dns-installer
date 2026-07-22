@@ -109,8 +109,19 @@ SAVE_ARCHIVE="technitium-save.tar.gz"
 BUNDLE_DIR="technitium-save"
 LOG_FILE="$base_dir/technitium-dns-install.log"
 
+# Install-time facts consumed by uninstall (resolver/firewall restore) — TD-2/TD-8.
+STATE_FILE="/opt/technitium/.installer-state"
+
 API_TOKEN=""
 API_BASE=""           # resolved by wait_for_webservice (http://127.0.0.1:<port>)
+
+SERVICE_CONFIRMED=0   # set once the web console is confirmed reachable (TD-4)
+RESOLVER_SNAP_DIR=""  # pre-install resolver snapshot (TD-3/TD-4/TD-14)
+RESOLVER_TAKEN_OVER="false"
+NM_HAD_DNS_LINE=""    # set by configure_host_resolver
+NM_PREV_DNS_VALUE=""  # set by configure_host_resolver
+FIREWALL_TYPE_DETECTED="none"
+FIREWALL_PORTS_ADDED=""
 
 # ============================================================================ #
 # -- Helpers --                                                                #
@@ -281,6 +292,252 @@ require_internet_artifact() {
   fi
 }
 
+# Read one KEY=value from the installer state file (empty when absent).
+state_get() {
+  local key="$1" v=""
+  [[ -f "$STATE_FILE" ]] || { echo ""; return 0; }
+  v="$(grep -E "^${key}=" "$STATE_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  echo "$v"
+}
+
+# ============================================================================ #
+# -- Host resolver: snapshot / restore / takeover --                           #
+# ============================================================================ #
+
+# Snapshot the pre-install resolver state so a failed install — or an online
+# install with DISABLE_SYSTEMD_RESOLVED=false, where the upstream install.sh
+# does its own unconditional takeover — can restore it (TD-3/TD-4).
+snapshot_resolver_state() {
+  RESOLVER_SNAP_DIR="$(mktemp -d)"
+  chmod 700 "$RESOLVER_SNAP_DIR"
+  # Capture the *contents* (cat, not cp -a): /etc/resolv.conf is often a symlink
+  # into systemd-resolved's runtime dir, and a preserved symlink dangles once
+  # systemd-resolved is disabled or after a reboot (TD-14).
+  if [[ -e /etc/resolv.conf ]]; then
+    cat /etc/resolv.conf > "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null || true
+  fi
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    cp -a /etc/NetworkManager/NetworkManager.conf "$RESOLVER_SNAP_DIR/NetworkManager.conf"
+  fi
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    echo "active" > "$RESOLVER_SNAP_DIR/resolved.state"
+  fi
+  if systemctl is-enabled --quiet systemd-resolved 2>/dev/null; then
+    echo "enabled" > "$RESOLVER_SNAP_DIR/resolved.enabled"
+  fi
+}
+
+# True when the live resolver state differs from the pre-install snapshot.
+resolver_state_changed() {
+  [[ -n "$RESOLVER_SNAP_DIR" && -d "$RESOLVER_SNAP_DIR" ]] || return 1
+  local now snap
+  now="$(cat /etc/resolv.conf 2>/dev/null || true)"
+  snap="$(cat "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null || true)"
+  [[ "$now" != "$snap" ]] && return 0
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.state" ]] && ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+restore_resolver_snapshot() {
+  [[ -n "$RESOLVER_SNAP_DIR" && -d "$RESOLVER_SNAP_DIR" ]] || return 0
+  if [[ -f "$RESOLVER_SNAP_DIR/resolv.conf" ]]; then
+    rm -f /etc/resolv.conf
+    cat "$RESOLVER_SNAP_DIR/resolv.conf" > /etc/resolv.conf
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/NetworkManager.conf" ]]; then
+    cp -a "$RESOLVER_SNAP_DIR/NetworkManager.conf" /etc/NetworkManager/NetworkManager.conf
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.enabled" ]]; then
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.state" ]]; then
+    systemctl start systemd-resolved >/dev/null 2>&1 || true
+  fi
+}
+
+# TD-3: the upstream install.sh commandeers the resolver unconditionally on the
+# online path. When the user asked for DISABLE_SYSTEMD_RESOLVED=false, undo it.
+online_resolver_compensate() {
+  [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]] && return 0
+  if resolver_state_changed; then
+    log "DISABLE_SYSTEMD_RESOLVED=false: upstream install.sh modified the host resolver; restoring the pre-install state..."
+    restore_resolver_snapshot
+    log "Host resolver restored."
+  fi
+}
+
+# Point the host at 127.0.0.1 and stop NetworkManager from clobbering resolv.conf
+# (mirrors the upstream install.sh resolver handling). Idempotent.
+configure_host_resolver() {
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    # Only an *active* 'dns=' line counts — a commented '#dns=' line must not
+    # stop us from setting dns=none (TD-19).
+    if grep -qE '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf; then
+      NM_HAD_DNS_LINE="true"
+      NM_PREV_DNS_VALUE="$(grep -E '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf | head -n1 | cut -d= -f2- || true)"
+      sed -i 's/^[[:space:]]*dns=.*/dns=none/' /etc/NetworkManager/NetworkManager.conf
+    elif grep -qE '^\[main\]' /etc/NetworkManager/NetworkManager.conf; then
+      NM_HAD_DNS_LINE="false"
+      sed -i '/^\[main\]/a dns=none' /etc/NetworkManager/NetworkManager.conf
+    else
+      NM_HAD_DNS_LINE="false"
+      printf "\n[main]\ndns=none\n" >> /etc/NetworkManager/NetworkManager.conf
+    fi
+  fi
+  # Persistent backup for uninstall: real file contents, never a symlink (TD-14).
+  # Refresh it when it is missing, a symlink, or already-clobbered with the
+  # takeover content (the upstream install.sh overwrites it on every online
+  # run) — provided the pre-install snapshot holds something better.
+  local bak="$DNS_APP_DIR/resolv.conf.bak"
+  local bak_unusable=0
+  if [[ ! -e "$bak" || -L "$bak" ]]; then
+    bak_unusable=1
+  elif grep -q '127\.0\.0\.1' "$bak" 2>/dev/null; then
+    bak_unusable=1
+  fi
+  if (( bak_unusable )) && [[ -f "${RESOLVER_SNAP_DIR:-/nonexistent}/resolv.conf" ]] \
+       && ! grep -q '127\.0\.0\.1' "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null; then
+    rm -f "$bak"
+    cp "$RESOLVER_SNAP_DIR/resolv.conf" "$bak"
+  elif [[ ! -e "$bak" && ! -L "$bak" ]]; then
+    cat /etc/resolv.conf > "$bak" 2>/dev/null || true
+  fi
+  rm -f /etc/resolv.conf
+  printf "# Generated by Technitium DNS Server Installer\n\nnameserver 127.0.0.1\n" > /etc/resolv.conf
+}
+
+# Resolver policy: runs AFTER dns.service is confirmed up (TD-4), on every
+# install run including re-runs (TD-13).
+apply_resolver_policy() {
+  if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
+    log "Commandeering host resolver -> 127.0.0.1 (DISABLE_SYSTEMD_RESOLVED=true)..."
+    local resolved_was_running=0
+    systemctl is-active --quiet systemd-resolved 2>/dev/null && resolved_was_running=1
+    systemctl stop systemd-resolved >/dev/null 2>&1 || true
+    systemctl disable systemd-resolved >/dev/null 2>&1 || true
+    configure_host_resolver
+    RESOLVER_TAKEN_OVER="true"
+    if (( resolved_was_running )); then
+      # systemd-resolved held (127.0.0.53):53 until now; restart so the DNS
+      # server can (re)bind port 53 cleanly.
+      log "Restarting dns.service to bind port 53 now that systemd-resolved is stopped..."
+      debug_run systemctl restart dns.service
+    fi
+  else
+    if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
+      log "DISABLE_SYSTEMD_RESOLVED=false: host resolver left untouched."
+    else
+      log "DISABLE_SYSTEMD_RESOLVED=false: host resolver left as before the install (upstream takeover compensated)."
+    fi
+  fi
+}
+
+# ============================================================================ #
+# -- Firewall handling (TD-8) --                                               #
+# ============================================================================ #
+
+# Open DNS + web-console ports when a host firewall is active (firewalld on
+# Rocky/Leap, UFW on Ubuntu). Records exactly what was added in the state file
+# so uninstall removes only that.
+configure_firewall() {
+  local -a wanted=("53/udp" "53/tcp" "${DNS_WEB_PORT}/tcp")
+  [[ "$ENABLE_HTTPS" == "true" ]] && wanted+=("${DNS_HTTPS_PORT}/tcp")
+  local prev_added added="" p
+  prev_added="$(state_get FIREWALL_PORTS_ADDED)"
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    FIREWALL_TYPE_DETECTED="firewalld"
+    log "firewalld is active; ensuring DNS/web-console ports are open..."
+    for p in "${wanted[@]}"; do
+      if firewall-cmd --permanent --query-port="$p" >/dev/null 2>&1; then
+        log "  firewalld: $p already open"
+      else
+        firewall-cmd --permanent --add-port="$p" >/dev/null
+        added="$added $p"
+        log "  firewalld: opened $p"
+      fi
+    done
+    firewall-cmd --reload >/dev/null
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    FIREWALL_TYPE_DETECTED="ufw"
+    log "UFW is active; ensuring DNS/web-console ports are open..."
+    for p in "${wanted[@]}"; do
+      if ufw status | grep -qE "^${p}[[:space:]].*ALLOW"; then
+        log "  ufw: $p already allowed"
+      else
+        ufw allow "$p" >/dev/null
+        added="$added $p"
+        log "  ufw: allowed $p"
+      fi
+    done
+  else
+    log "No active host firewall (firewalld/UFW) detected; no firewall changes made."
+    # Keep any previously recorded type so uninstall can still clean up.
+    local prev_type; prev_type="$(state_get FIREWALL_TYPE)"
+    [[ -n "$prev_type" ]] && FIREWALL_TYPE_DETECTED="$prev_type"
+  fi
+  # Union of previously recorded + newly added ports (re-runs must not lose the record).
+  # shellcheck disable=SC2086
+  FIREWALL_PORTS_ADDED="$(printf '%s\n' $prev_added $added | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')"
+}
+
+# Remove exactly the firewall openings this installer recorded as added (TD-8).
+remove_firewall_rules() {
+  local fw_type="$1" fw_ports="$2" p
+  [[ -z "$fw_ports" || -z "$fw_type" || "$fw_type" == "none" ]] && return 0
+  log "Removing firewall openings added at install time ($fw_type): $fw_ports"
+  case "$fw_type" in
+    firewalld)
+      if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for p in $fw_ports; do
+          firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 || true
+          log "  firewalld: closed $p"
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || true
+      fi ;;
+    ufw)
+      if command -v ufw >/dev/null 2>&1; then
+        for p in $fw_ports; do
+          ufw --force delete allow "$p" >/dev/null 2>&1 || true
+          log "  ufw: removed allow $p"
+        done
+      fi ;;
+  esac
+}
+
+# Persist install-time facts consumed by uninstall. First-run values win on
+# re-runs (they describe the true pre-install state of the host).
+write_state_file() {
+  local prev_takeover prev_nm_had prev_nm_val prev_resolved_active
+  prev_takeover="$(state_get RESOLVER_TAKEOVER)"
+  prev_nm_had="$(state_get NM_HAD_DNS_LINE)"
+  prev_nm_val="$(state_get NM_PREV_DNS_VALUE)"
+  prev_resolved_active="$(state_get RESOLVED_WAS_ACTIVE)"
+
+  local takeover="$RESOLVER_TAKEN_OVER"
+  [[ "$prev_takeover" == "true" ]] && takeover="true"
+  local nm_had="${prev_nm_had:-$NM_HAD_DNS_LINE}"
+  local nm_val="${prev_nm_val:-$NM_PREV_DNS_VALUE}"
+  local resolved_active="false"
+  [[ -f "${RESOLVER_SNAP_DIR:-/nonexistent}/resolved.state" ]] && resolved_active="true"
+  [[ -n "$prev_resolved_active" ]] && resolved_active="$prev_resolved_active"
+
+  mkdir -p /opt/technitium
+  {
+    echo "# Technitium DNS installer state - consumed by 'uninstall'. Do not edit."
+    echo "STATE_SCRIPT_VERSION=$SCRIPT_VERSION"
+    echo "INSTALLED_AT=$(date)"
+    echo "RESOLVER_TAKEOVER=$takeover"
+    echo "NM_HAD_DNS_LINE=$nm_had"
+    echo "NM_PREV_DNS_VALUE=$nm_val"
+    echo "RESOLVED_WAS_ACTIVE=$resolved_active"
+    echo "FIREWALL_TYPE=$FIREWALL_TYPE_DETECTED"
+    echo "FIREWALL_PORTS_ADDED=$FIREWALL_PORTS_ADDED"
+  } > "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+}
+
 # ============================================================================ #
 # -- Install: online (wrap upstream install.sh) --                            #
 # ============================================================================ #
@@ -330,42 +587,48 @@ install_offline() {
     exit 1
   fi
 
-  # 5. systemd service + user + host DNS (mirrors upstream install.sh)
+  # 5. systemd service + user (mirrors upstream install.sh). The host-resolver
+  #    takeover deliberately does NOT happen here: it runs only after the
+  #    service is confirmed up (apply_resolver_policy, TD-4).
   if [[ "$(ps --no-headers -o comm 1 | tr -d '\n')" != "systemd" ]]; then
     log "ERROR: systemd was not detected; cannot install the dns.service unit."
     exit 1
   fi
 
+  id "$SERVICE_USER" &>/dev/null || useradd --system -M --shell /usr/sbin/nologin "$SERVICE_USER"
+  # Re-runs re-extract the package as root, so ownership must be reasserted on
+  # every run, not just the first (TD-13).
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$DNS_APP_DIR" "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
+
   if [[ -f "$SYSTEMD_UNIT" ]]; then
     log "Existing dns.service found -> restarting."
     debug_run systemctl restart dns.service
   else
-    id "$SERVICE_USER" &>/dev/null || useradd --system -M --shell /usr/sbin/nologin "$SERVICE_USER"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$DNS_APP_DIR" "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
     cp "$DNS_APP_DIR/systemd.service" "$SYSTEMD_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
     debug_run systemctl enable dns.service
-    if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
-      systemctl stop systemd-resolved >/dev/null 2>&1 || true
-      systemctl disable systemd-resolved >/dev/null 2>&1 || true
-      configure_host_resolver
-    fi
     debug_run systemctl start dns.service
   fi
 }
 
-# Point the host at 127.0.0.1 and stop NetworkManager from clobbering resolv.conf
-# (mirrors the upstream install.sh resolver handling).
-configure_host_resolver() {
-  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
-    if ! grep -qF "dns=" /etc/NetworkManager/NetworkManager.conf; then
-      printf "\n[main]\ndns=none\n" >> /etc/NetworkManager/NetworkManager.conf
-    elif ! grep -qF "dns=none" /etc/NetworkManager/NetworkManager.conf; then
-      sed -i "s/^dns=.*/dns=none/g" /etc/NetworkManager/NetworkManager.conf
-    fi
+# Verify the install actually produced a live service before anything gets
+# commandeered (TD-4) — and fail loudly when the fully-delegated upstream
+# install.sh path did not deliver (TD-20).
+verify_service_install() {
+  if [[ ! -f "$SYSTEMD_UNIT" ]]; then
+    log "ERROR: $SYSTEMD_UNIT not found after install - the install did not complete."
+    exit 1
   fi
-  [[ -f "$DNS_APP_DIR/resolv.conf.bak" ]] || cp -a /etc/resolv.conf "$DNS_APP_DIR/resolv.conf.bak" 2>/dev/null || true
-  rm -f /etc/resolv.conf
-  printf "# Generated by Technitium DNS Server Installer\n\nnameserver 127.0.0.1\n" > /etc/resolv.conf
+  local tries=0
+  while (( tries < 30 )); do
+    systemctl is-active --quiet dns.service && break
+    sleep 2; tries=$((tries+1))
+  done
+  if ! systemctl is-active --quiet dns.service; then
+    log "ERROR: dns.service is not active after install. Check 'journalctl -u dns.service'."
+    exit 1
+  fi
+  log "dns.service is active."
 }
 
 # ============================================================================ #
@@ -380,6 +643,7 @@ wait_for_webservice() {
     while (( tries < 30 )); do
       if curl -fsS -o /dev/null "http://127.0.0.1:${p}/api/user/login?user=x&pass=x" 2>/dev/null; then
         API_BASE="http://127.0.0.1:${p}"
+        SERVICE_CONFIRMED=1
         log "Web console reachable on port ${p}."
         return 0
       fi
@@ -863,6 +1127,7 @@ run_upgrade() {
     exit 1
   fi
   air_gap_check
+  snapshot_resolver_state
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
     log "Upgrading (offline) from bundle..."
     local b="$base_dir/$BUNDLE_DIR"
@@ -873,42 +1138,128 @@ run_upgrade() {
   else
     log "Upgrading (online) via upstream install.sh (config in $DNS_CONFIG_DIR is preserved)..."
     install_online
+    online_resolver_compensate
   fi
+  verify_service_install
+  rm -rf "$RESOLVER_SNAP_DIR"
   log "Upgrade complete."
 }
 
 # ============================================================================ #
 # -- uninstall (non-interactive replica of upstream uninstall.sh) --           #
 # ============================================================================ #
+
+# Evidence that an install commandeered the host resolver: the state marker, a
+# resolver backup, the installer-written resolv.conf header, or (heuristic for
+# pre-marker installs) a live unit plus resolv.conf pointing at 127.0.0.1.
+resolver_takeover_evident() {
+  local dnsDir="$1" unit_present="$2" st_takeover="$3"
+  [[ "$st_takeover" == "true" ]] && return 0
+  [[ -e "$dnsDir/resolv.conf.bak" || -L "$dnsDir/resolv.conf.bak" ]] && return 0
+  grep -qs "Generated by Technitium DNS Server Installer" /etc/resolv.conf && return 0
+  if (( unit_present )) && grep -qsE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1' /etc/resolv.conf; then
+    return 0
+  fi
+  return 1
+}
+
+restore_resolver_on_uninstall() {
+  local dnsDir="$1" nm_had="$2" nm_val="$3" resolved_was_active="$4"
+  local bak="$dnsDir/resolv.conf.bak"
+  rm -f /etc/resolv.conf
+  if [[ -f "$bak" ]] && ! grep -q '127\.0\.0\.1' "$bak" 2>/dev/null; then
+    # Regular backup (or symlink to an existing file): restore its contents as
+    # a real file — never re-create a symlink that may dangle (TD-14).
+    cat "$bak" > /etc/resolv.conf
+  elif [[ -f "$bak" ]]; then
+    # Backup was clobbered with the takeover content (upstream online re-runs
+    # overwrite it) — restoring it would restore 127.0.0.1 with no server.
+    log "resolv.conf backup contains the takeover content; falling back to public nameservers."
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  elif [[ -L "$bak" ]]; then
+    # Dangling symlink backup from a pre-fix install (TD-14).
+    log "resolv.conf backup is a dangling symlink; falling back to public nameservers."
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  else
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  fi
+
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    if [[ "$nm_had" == "true" && -n "$nm_val" ]]; then
+      sed -i "s/^dns=none/dns=${nm_val}/" /etc/NetworkManager/NetworkManager.conf || true
+    elif [[ "$nm_had" == "false" ]]; then
+      sed -i '/^dns=none$/d' /etc/NetworkManager/NetworkManager.conf || true
+    else
+      sed -i "s/^dns=none/dns=default/g" /etc/NetworkManager/NetworkManager.conf || true
+    fi
+  fi
+
+  # Re-enable systemd-resolved when the state marker says it was active before
+  # install, when the restored resolv.conf needs the resolved stub, or (legacy,
+  # no state marker) per the DISABLE_SYSTEMD_RESOLVED env as before.
+  local reenable=0
+  [[ "$resolved_was_active" == "true" ]] && reenable=1
+  grep -qs '127\.0\.0\.53' /etc/resolv.conf && reenable=1
+  [[ -z "$resolved_was_active" && "$DISABLE_SYSTEMD_RESOLVED" == "true" ]] && reenable=1
+  if (( reenable )); then
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
+    systemctl start  systemd-resolved >/dev/null 2>&1 || true
+  fi
+  log "Host resolver restored."
+}
+
 run_uninstall() {
   check_root_privileges
+  init_log
   log "# -- Uninstalling Technitium DNS Server - $(date) -- #"
+
   local dnsDir="$DNS_APP_DIR"
-  [[ -d /etc/dns/config && ! -d "$DNS_APP_DIR" ]] && dnsDir="/etc/dns"
+  # Legacy-layout fallback: only when /etc/dns actually CONTAINS the app.
+  # Otherwise a second uninstall run would select the preserved config dir and
+  # purge it despite PURGE_DATA=false (TD-1).
+  if [[ ! -d "$DNS_APP_DIR" && -f "$DNS_CONFIG_DIR/DnsServerApp.dll" ]]; then
+    dnsDir="$DNS_CONFIG_DIR"
+  fi
+
+  local unit_present=0
+  [[ -f "$SYSTEMD_UNIT" ]] && unit_present=1
+
+  # TD-2: never touch the resolver or firewall on a host this installer (or the
+  # upstream scripts) never installed on.
+  if [[ ! -f "$SYSTEMD_UNIT" && ! -d "$DNS_APP_DIR" && ! -f "$DNS_CONFIG_DIR/DnsServerApp.dll" && ! -f "$STATE_FILE" ]]; then
+    log "No Technitium DNS Server installation found (no dns.service unit, app directory, or installer state)."
+    log "Nothing to uninstall; host resolver and firewall left untouched."
+    return 0
+  fi
+
+  local st_takeover st_fw_type st_fw_ports st_nm_had st_nm_val st_resolved_active
+  st_takeover="$(state_get RESOLVER_TAKEOVER)"
+  st_fw_type="$(state_get FIREWALL_TYPE)"
+  st_fw_ports="$(state_get FIREWALL_PORTS_ADDED)"
+  st_nm_had="$(state_get NM_HAD_DNS_LINE)"
+  st_nm_val="$(state_get NM_PREV_DNS_VALUE)"
+  st_resolved_active="$(state_get RESOLVED_WAS_ACTIVE)"
 
   if [[ "$(ps --no-headers -o comm 1 | tr -d '\n')" == "systemd" ]]; then
     systemctl disable dns.service >/dev/null 2>&1 || true
     systemctl stop dns.service    >/dev/null 2>&1 || true
     rm -f "$SYSTEMD_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true   # drop the stale unit (TD-18)
 
-    # Restore host resolver
-    rm -f /etc/resolv.conf
-    if [[ -f "$dnsDir/resolv.conf.bak" ]]; then
-      cp -a "$dnsDir/resolv.conf.bak" /etc/resolv.conf
+    # Restore the host resolver only on evidence that an install actually
+    # commandeered it (TD-2).
+    if resolver_takeover_evident "$dnsDir" "$unit_present" "$st_takeover"; then
+      restore_resolver_on_uninstall "$dnsDir" "$st_nm_had" "$st_nm_val" "$st_resolved_active"
     else
-      printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
-    fi
-    if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
-      sed -i "s/^dns=none/dns=default/g" /etc/NetworkManager/NetworkManager.conf || true
-    fi
-    if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
-      systemctl enable systemd-resolved >/dev/null 2>&1 || true
-      systemctl start  systemd-resolved >/dev/null 2>&1 || true
+      log "No evidence the installer commandeered the host resolver; leaving /etc/resolv.conf, NetworkManager and systemd-resolved untouched."
     fi
     userdel -f "$SERVICE_USER" >/dev/null 2>&1 || true
   fi
 
+  remove_firewall_rules "$st_fw_type" "$st_fw_ports"
+
   rm -rf "$dnsDir"
+  rm -f "$STATE_FILE"
   # Drop the now-empty /opt/technitium parent (upstream leaves it behind).
   [[ "$dnsDir" == "$DNS_APP_DIR" ]] && rmdir /opt/technitium 2>/dev/null || true
 
@@ -922,8 +1273,12 @@ run_uninstall() {
   if [[ "$PURGE_DATA" == "true" && -d "$DNS_CONFIG_DIR" ]]; then
     log "Purging config/zone data ($DNS_CONFIG_DIR)..."
     rm -rf "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
+    rmdir /var/log/technitium 2>/dev/null || true
   else
+    # Reset preserved dirs to root ownership — the dns-server user is gone and
+    # orphan-UID files would linger otherwise (TD-18).
     [[ -d "$DNS_CONFIG_DIR" ]] && chown -R root:root "$DNS_CONFIG_DIR" 2>/dev/null || true
+    [[ -d "$DNS_LOG_DIR" ]]    && chown -R root:root "$DNS_LOG_DIR"    2>/dev/null || true
     log "Config folder $DNS_CONFIG_DIR preserved (set PURGE_DATA=true to delete it)."
   fi
   log "Uninstall complete."
@@ -932,6 +1287,25 @@ run_uninstall() {
 # ============================================================================ #
 # -- install orchestrator --                                                   #
 # ============================================================================ #
+
+# EXIT trap while installing (TD-4): if the run dies before the DNS service was
+# confirmed up, put the resolver back the way it was — never strand the host
+# with 'nameserver 127.0.0.1' and nothing answering on :53.
+on_install_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )); then
+    log "ERROR: install did not complete (exit $rc)."
+    if (( SERVICE_CONFIRMED == 0 )) && resolver_state_changed; then
+      log "Restoring the pre-install resolver state (the DNS service was never confirmed up)..."
+      restore_resolver_snapshot
+      log "Resolver restored."
+    fi
+  fi
+  [[ -n "${RESOLVER_SNAP_DIR:-}" ]] && rm -rf "$RESOLVER_SNAP_DIR"
+  exit "$rc"
+}
+
 run_install() {
   check_root_privileges
   os_check
@@ -940,12 +1314,21 @@ run_install() {
   chmod 600 "$LOG_FILE" 2>/dev/null || true
   log "# -- Technitium DNS Server Installer v${SCRIPT_VERSION} Started - $(date) -- #"
   air_gap_check
+  snapshot_resolver_state
+  trap on_install_exit EXIT
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
     install_offline
   else
     install_online
+    online_resolver_compensate   # TD-3: honour DISABLE_SYSTEMD_RESOLVED=false online
   fi
+  verify_service_install         # TD-20: don't trust the delegated path blindly
   configure_dns_server
+  apply_resolver_policy          # TD-4: takeover only after the service is confirmed up
+  configure_firewall             # TD-8: after config, so the final web port is known
+  write_state_file
+  trap - EXIT
+  rm -rf "$RESOLVER_SNAP_DIR"
 
   log ""
   log "================================================================"
