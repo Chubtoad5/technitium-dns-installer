@@ -377,6 +377,13 @@ configure_host_resolver() {
     if grep -qE '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf; then
       NM_HAD_DNS_LINE="true"
       NM_PREV_DNS_VALUE="$(grep -E '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf | head -n1 | cut -d= -f2- || true)"
+      if [[ "$NM_PREV_DNS_VALUE" == "none" ]]; then
+        # An existing dns=none is this installer's own leftover takeover from an
+        # earlier run whose state is gone — never record it as the host's
+        # pre-install value, or uninstall would "restore" dns=none (P4-03)
+        NM_HAD_DNS_LINE="false"
+        NM_PREV_DNS_VALUE=""
+      fi
       sed -i 's/^[[:space:]]*dns=.*/dns=none/' /etc/NetworkManager/NetworkManager.conf
     elif grep -qE '^\[main\]' /etc/NetworkManager/NetworkManager.conf; then
       NM_HAD_DNS_LINE="false"
@@ -1185,13 +1192,17 @@ restore_resolver_on_uninstall() {
   fi
 
   if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
-    if [[ "$nm_had" == "true" && -n "$nm_val" ]]; then
+    if [[ "$nm_had" == "true" && -n "$nm_val" && "$nm_val" != "none" ]]; then
       sed -i "s/^dns=none/dns=${nm_val}/" /etc/NetworkManager/NetworkManager.conf || true
-    elif [[ "$nm_had" == "false" ]]; then
-      sed -i '/^dns=none$/d' /etc/NetworkManager/NetworkManager.conf || true
     else
-      sed -i "s/^dns=none/dns=default/g" /etc/NetworkManager/NetworkManager.conf || true
+      # No trustworthy pre-install value (or the recorded value is the
+      # installer's own 'none') — remove the line entirely so NetworkManager
+      # resumes managing resolv.conf (P4-03)
+      sed -i '/^dns=none$/d' /etc/NetworkManager/NetworkManager.conf || true
     fi
+    # Without a reload NetworkManager keeps the takeover config until the next
+    # reboot and resolv.conf never self-heals (P4-03)
+    systemctl try-reload-or-restart NetworkManager >/dev/null 2>&1 || true
   fi
 
   # Re-enable systemd-resolved when the state marker says it was active before
