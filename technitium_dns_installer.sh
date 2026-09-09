@@ -14,8 +14,11 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="1.1.0"
-base_dir=$(pwd)
+SCRIPT_VERSION="1.2.0"
+# Anchor to the script's own directory (TD-6): the air-gap bundle/sentinel are
+# expected next to the script. air_gap_check keeps a compat fallback to $PWD.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+base_dir="$script_dir"
 
 # ============================================================================ #
 # -- USER DEFINED Configuration Variables (override at runtime) --             #
@@ -36,6 +39,9 @@ LICENSE_OFFER_CONTACT=${LICENSE_OFFER_CONTACT:-"the Chubtoad5 project via https:
 # -- Admin user / credentials -- #
 DNS_ADMIN_USER=${DNS_ADMIN_USER:-"admin"}        # built-in admin account (rename not supported in v1.0)
 DNS_ADMIN_PASSWORD=${DNS_ADMIN_PASSWORD:-"changeme"}
+# Password rotation: when re-running with a NEW DNS_ADMIN_PASSWORD, pass the
+# previous one here so the installer can authenticate and rotate it (TD-11).
+DNS_ADMIN_CURRENT_PASSWORD=${DNS_ADMIN_CURRENT_PASSWORD:-""}
 
 # -- Web console (DNS management) -- #
 DNS_WEB_PORT=${DNS_WEB_PORT:-"5380"}             # upstream default is 5380
@@ -44,6 +50,7 @@ DNS_HTTPS_PORT=${DNS_HTTPS_PORT:-"53443"}        # only used when ENABLE_HTTPS=t
 
 # -- Host integration -- #
 DISABLE_SYSTEMD_RESOLVED=${DISABLE_SYSTEMD_RESOLVED:-"true"}  # mirrors upstream install.sh behaviour
+FORCE_ONLINE=${FORCE_ONLINE:-"false"}            # ignore an air-gap sentinel and install online (TD-17)
 
 # -- Uninstall behaviour -- #
 PURGE_DATA=${PURGE_DATA:-"false"}                # also remove /etc/dns (all zones/config) on uninstall
@@ -102,13 +109,27 @@ SAVE_ARCHIVE="technitium-save.tar.gz"
 BUNDLE_DIR="technitium-save"
 LOG_FILE="$base_dir/technitium-dns-install.log"
 
+# Install-time facts consumed by uninstall (resolver/firewall restore) — TD-2/TD-8.
+STATE_FILE="/opt/technitium/.installer-state"
+
 API_TOKEN=""
 API_BASE=""           # resolved by wait_for_webservice (http://127.0.0.1:<port>)
+
+SERVICE_CONFIRMED=0   # set once the web console is confirmed reachable (TD-4)
+RESOLVER_SNAP_DIR=""  # pre-install resolver snapshot (TD-3/TD-4/TD-14)
+RESOLVER_TAKEN_OVER="false"
+NM_HAD_DNS_LINE=""    # set by configure_host_resolver
+NM_PREV_DNS_VALUE=""  # set by configure_host_resolver
+FIREWALL_TYPE_DETECTED="none"
+FIREWALL_PORTS_ADDED=""
 
 # ============================================================================ #
 # -- Helpers --                                                                #
 # ============================================================================ #
 log()  { echo "$*" | tee -a "$LOG_FILE"; }
+
+# Create/append the log with restrictive perms (it captures full command output).
+init_log() { : >> "$LOG_FILE"; chmod 600 "$LOG_FILE" 2>/dev/null || true; }
 
 usage() {
   cat << EOF
@@ -131,9 +152,12 @@ Commands:
 
 Core environment overrides (see README.md for the full list):
   DNS_ADMIN_PASSWORD   Admin password to set (default: changeme)
+  DNS_ADMIN_CURRENT_PASSWORD
+                       Current password when rotating to a new DNS_ADMIN_PASSWORD
   DNS_WEB_PORT         Web console HTTP port (default: 5380)
   ENABLE_HTTPS         Serve the console over HTTPS self-signed (default: false)
   DNS_HTTPS_PORT       HTTPS port when ENABLE_HTTPS=true (default: 53443)
+  FORCE_ONLINE         Ignore an air-gap bundle and install online (default: false)
   PURGE_DATA           uninstall also removes $DNS_CONFIG_DIR (default: false)
   REMOVE_DOTNET        uninstall also removes $DOTNET_DIR (default: false)
 
@@ -187,6 +211,25 @@ os_check() {
   fi
 }
 
+# Fail early with distro-specific hints when a required tool is missing —
+# minimal cloud images often ship without curl (TD-15).
+preflight_dependencies() {
+  local -a required=(curl tar grep sed awk)
+  local -a missing=()
+  local c
+  for c in "${required[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+  echo "ERROR: missing required command(s): ${missing[*]}"
+  case "${OS_ID:-}" in
+    ubuntu|debian)                          echo "  Install with: sudo apt-get update && sudo apt-get install -y ${missing[*]}" ;;
+    rhel|centos|rocky|almalinux|fedora)     echo "  Install with: sudo dnf install -y ${missing[*]}" ;;
+    sles|opensuse-leap|opensuse-tumbleweed) echo "  Install with: sudo zypper -n install ${missing[*]}" ;;
+  esac
+  exit 1
+}
+
 # Resolve the best-available libicu package name for the running distro.
 icu_package_name() {
   case "$OS_ID" in
@@ -195,15 +238,50 @@ icu_package_name() {
       elif apt-cache show libicu72 >/dev/null 2>&1; then echo "libicu72"
       elif apt-cache show libicu70 >/dev/null 2>&1; then echo "libicu70"
       else echo "libicu-dev"; fi ;;
-    *) echo "libicu" ;;   # dnf/yum/zypper all ship a 'libicu' package
+    sles|opensuse-leap|opensuse-tumbleweed)
+      # SUSE names the ICU runtime by soname (libicu73_2, libicu76_1, ...);
+      # plain 'libicu' has no provider on Leap 16 (TD-9). Prefer an already
+      # installed package, then the newest zypper-resolvable candidate.
+      local icu_pkg=""
+      icu_pkg="$(rpm -qa --qf '%{NAME}\n' 2>/dev/null \
+                   | grep -E '^libicu[0-9]+(_[0-9]+)*$' | sort -V | tail -n1 || true)"
+      if [[ -z "$icu_pkg" ]]; then
+        icu_pkg="$(zypper --non-interactive search -t package 'libicu*' 2>/dev/null \
+                     | awk -F'|' 'NF>=3 {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' \
+                     | grep -E '^libicu[0-9]+(_[0-9]+)*$' | sort -V | tail -n1 || true)"
+      fi
+      if [[ -n "$icu_pkg" ]]; then echo "$icu_pkg"; else echo "libicu"; fi ;;
+    *) echo "libicu" ;;   # dnf/yum ship a 'libicu' package
   esac
 }
 
+# Detect an air-gap bundle next to the script (TD-6), with a compat fallback to
+# the current working directory. A sentinel without a usable bundle is treated
+# as stale and reported instead of silently flipping install modes (TD-17).
 air_gap_check() {
-  if [[ -f "$base_dir/$SAVE_SENTINEL" ]]; then
-    AIR_GAPPED_MODE=1
-    log "Air-gap bundle detected ($SAVE_SENTINEL) -> offline install."
+  if [[ "$FORCE_ONLINE" == "true" ]]; then
+    log "FORCE_ONLINE=true -> ignoring any air-gap bundle; using the online path."
+    return 0
   fi
+  local -a candidates=("$script_dir")
+  [[ "$PWD" != "$script_dir" ]] && candidates+=("$PWD")
+  local d
+  for d in "${candidates[@]}"; do
+    [[ -f "$d/$SAVE_SENTINEL" ]] || continue
+    if [[ -f "$d/$BUNDLE_DIR/DnsServerPortable.tar.gz" ]]; then
+      AIR_GAPPED_MODE=1
+      base_dir="$d"
+      if [[ "$d" != "$script_dir" ]]; then
+        log "NOTE: air-gap bundle found in the current directory ($d), not next to the script; using it (compat fallback)."
+      fi
+      log "Air-gap bundle detected ($SAVE_SENTINEL) -> offline install."
+      return 0
+    fi
+    log "WARNING: found '$d/$SAVE_SENTINEL' but no usable bundle ('$BUNDLE_DIR/DnsServerPortable.tar.gz' missing) - stale sentinel?"
+    log "         Continuing with an ONLINE install. Remove the stale sentinel or re-extract the full $SAVE_ARCHIVE for an offline install."
+  done
+  log "No air-gap bundle found -> online install."
+  return 0
 }
 
 require_internet_artifact() {
@@ -212,6 +290,259 @@ require_internet_artifact() {
     log "ERROR: failed to download $3 from: $1"
     exit 1
   fi
+}
+
+# Read one KEY=value from the installer state file (empty when absent).
+state_get() {
+  local key="$1" v=""
+  [[ -f "$STATE_FILE" ]] || { echo ""; return 0; }
+  v="$(grep -E "^${key}=" "$STATE_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  echo "$v"
+}
+
+# ============================================================================ #
+# -- Host resolver: snapshot / restore / takeover --                           #
+# ============================================================================ #
+
+# Snapshot the pre-install resolver state so a failed install — or an online
+# install with DISABLE_SYSTEMD_RESOLVED=false, where the upstream install.sh
+# does its own unconditional takeover — can restore it (TD-3/TD-4).
+snapshot_resolver_state() {
+  RESOLVER_SNAP_DIR="$(mktemp -d)"
+  chmod 700 "$RESOLVER_SNAP_DIR"
+  # Capture the *contents* (cat, not cp -a): /etc/resolv.conf is often a symlink
+  # into systemd-resolved's runtime dir, and a preserved symlink dangles once
+  # systemd-resolved is disabled or after a reboot (TD-14).
+  if [[ -e /etc/resolv.conf ]]; then
+    cat /etc/resolv.conf > "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null || true
+  fi
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    cp -a /etc/NetworkManager/NetworkManager.conf "$RESOLVER_SNAP_DIR/NetworkManager.conf"
+  fi
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    echo "active" > "$RESOLVER_SNAP_DIR/resolved.state"
+  fi
+  if systemctl is-enabled --quiet systemd-resolved 2>/dev/null; then
+    echo "enabled" > "$RESOLVER_SNAP_DIR/resolved.enabled"
+  fi
+}
+
+# True when the live resolver state differs from the pre-install snapshot.
+resolver_state_changed() {
+  [[ -n "$RESOLVER_SNAP_DIR" && -d "$RESOLVER_SNAP_DIR" ]] || return 1
+  local now snap
+  now="$(cat /etc/resolv.conf 2>/dev/null || true)"
+  snap="$(cat "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null || true)"
+  [[ "$now" != "$snap" ]] && return 0
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.state" ]] && ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+restore_resolver_snapshot() {
+  [[ -n "$RESOLVER_SNAP_DIR" && -d "$RESOLVER_SNAP_DIR" ]] || return 0
+  if [[ -f "$RESOLVER_SNAP_DIR/resolv.conf" ]]; then
+    rm -f /etc/resolv.conf
+    cat "$RESOLVER_SNAP_DIR/resolv.conf" > /etc/resolv.conf
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/NetworkManager.conf" ]]; then
+    cp -a "$RESOLVER_SNAP_DIR/NetworkManager.conf" /etc/NetworkManager/NetworkManager.conf
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.enabled" ]]; then
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$RESOLVER_SNAP_DIR/resolved.state" ]]; then
+    systemctl start systemd-resolved >/dev/null 2>&1 || true
+  fi
+}
+
+# TD-3: the upstream install.sh commandeers the resolver unconditionally on the
+# online path. When the user asked for DISABLE_SYSTEMD_RESOLVED=false, undo it.
+online_resolver_compensate() {
+  [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]] && return 0
+  if resolver_state_changed; then
+    log "DISABLE_SYSTEMD_RESOLVED=false: upstream install.sh modified the host resolver; restoring the pre-install state..."
+    restore_resolver_snapshot
+    log "Host resolver restored."
+  fi
+}
+
+# Point the host at 127.0.0.1 and stop NetworkManager from clobbering resolv.conf
+# (mirrors the upstream install.sh resolver handling). Idempotent.
+configure_host_resolver() {
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    # Only an *active* 'dns=' line counts — a commented '#dns=' line must not
+    # stop us from setting dns=none (TD-19).
+    if grep -qE '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf; then
+      NM_HAD_DNS_LINE="true"
+      NM_PREV_DNS_VALUE="$(grep -E '^[[:space:]]*dns=' /etc/NetworkManager/NetworkManager.conf | head -n1 | cut -d= -f2- || true)"
+      if [[ "$NM_PREV_DNS_VALUE" == "none" ]]; then
+        # An existing dns=none is this installer's own leftover takeover from an
+        # earlier run whose state is gone — never record it as the host's
+        # pre-install value, or uninstall would "restore" dns=none (P4-03)
+        NM_HAD_DNS_LINE="false"
+        NM_PREV_DNS_VALUE=""
+      fi
+      sed -i 's/^[[:space:]]*dns=.*/dns=none/' /etc/NetworkManager/NetworkManager.conf
+    elif grep -qE '^\[main\]' /etc/NetworkManager/NetworkManager.conf; then
+      NM_HAD_DNS_LINE="false"
+      sed -i '/^\[main\]/a dns=none' /etc/NetworkManager/NetworkManager.conf
+    else
+      NM_HAD_DNS_LINE="false"
+      printf "\n[main]\ndns=none\n" >> /etc/NetworkManager/NetworkManager.conf
+    fi
+  fi
+  # Persistent backup for uninstall: real file contents, never a symlink (TD-14).
+  # Refresh it when it is missing, a symlink, or already-clobbered with the
+  # takeover content (the upstream install.sh overwrites it on every online
+  # run) — provided the pre-install snapshot holds something better.
+  local bak="$DNS_APP_DIR/resolv.conf.bak"
+  local bak_unusable=0
+  if [[ ! -e "$bak" || -L "$bak" ]]; then
+    bak_unusable=1
+  elif grep -q '127\.0\.0\.1' "$bak" 2>/dev/null; then
+    bak_unusable=1
+  fi
+  if (( bak_unusable )) && [[ -f "${RESOLVER_SNAP_DIR:-/nonexistent}/resolv.conf" ]] \
+       && ! grep -q '127\.0\.0\.1' "$RESOLVER_SNAP_DIR/resolv.conf" 2>/dev/null; then
+    rm -f "$bak"
+    cp "$RESOLVER_SNAP_DIR/resolv.conf" "$bak"
+  elif [[ ! -e "$bak" && ! -L "$bak" ]]; then
+    cat /etc/resolv.conf > "$bak" 2>/dev/null || true
+  fi
+  rm -f /etc/resolv.conf
+  printf "# Generated by Technitium DNS Server Installer\n\nnameserver 127.0.0.1\n" > /etc/resolv.conf
+}
+
+# Resolver policy: runs AFTER dns.service is confirmed up (TD-4), on every
+# install run including re-runs (TD-13).
+apply_resolver_policy() {
+  if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
+    log "Commandeering host resolver -> 127.0.0.1 (DISABLE_SYSTEMD_RESOLVED=true)..."
+    local resolved_was_running=0
+    systemctl is-active --quiet systemd-resolved 2>/dev/null && resolved_was_running=1
+    systemctl stop systemd-resolved >/dev/null 2>&1 || true
+    systemctl disable systemd-resolved >/dev/null 2>&1 || true
+    configure_host_resolver
+    RESOLVER_TAKEN_OVER="true"
+    if (( resolved_was_running )); then
+      # systemd-resolved held (127.0.0.53):53 until now; restart so the DNS
+      # server can (re)bind port 53 cleanly.
+      log "Restarting dns.service to bind port 53 now that systemd-resolved is stopped..."
+      debug_run systemctl restart dns.service
+    fi
+  else
+    if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
+      log "DISABLE_SYSTEMD_RESOLVED=false: host resolver left untouched."
+    else
+      log "DISABLE_SYSTEMD_RESOLVED=false: host resolver left as before the install (upstream takeover compensated)."
+    fi
+  fi
+}
+
+# ============================================================================ #
+# -- Firewall handling (TD-8) --                                               #
+# ============================================================================ #
+
+# Open DNS + web-console ports when a host firewall is active (firewalld on
+# Rocky/Leap, UFW on Ubuntu). Records exactly what was added in the state file
+# so uninstall removes only that.
+configure_firewall() {
+  local -a wanted=("53/udp" "53/tcp" "${DNS_WEB_PORT}/tcp")
+  [[ "$ENABLE_HTTPS" == "true" ]] && wanted+=("${DNS_HTTPS_PORT}/tcp")
+  local prev_added added="" p
+  prev_added="$(state_get FIREWALL_PORTS_ADDED)"
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    FIREWALL_TYPE_DETECTED="firewalld"
+    log "firewalld is active; ensuring DNS/web-console ports are open..."
+    for p in "${wanted[@]}"; do
+      if firewall-cmd --permanent --query-port="$p" >/dev/null 2>&1; then
+        log "  firewalld: $p already open"
+      else
+        firewall-cmd --permanent --add-port="$p" >/dev/null
+        added="$added $p"
+        log "  firewalld: opened $p"
+      fi
+    done
+    firewall-cmd --reload >/dev/null
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    FIREWALL_TYPE_DETECTED="ufw"
+    log "UFW is active; ensuring DNS/web-console ports are open..."
+    for p in "${wanted[@]}"; do
+      if ufw status | grep -qE "^${p}[[:space:]].*ALLOW"; then
+        log "  ufw: $p already allowed"
+      else
+        ufw allow "$p" >/dev/null
+        added="$added $p"
+        log "  ufw: allowed $p"
+      fi
+    done
+  else
+    log "No active host firewall (firewalld/UFW) detected; no firewall changes made."
+    # Keep any previously recorded type so uninstall can still clean up.
+    local prev_type; prev_type="$(state_get FIREWALL_TYPE)"
+    [[ -n "$prev_type" ]] && FIREWALL_TYPE_DETECTED="$prev_type"
+  fi
+  # Union of previously recorded + newly added ports (re-runs must not lose the record).
+  # shellcheck disable=SC2086
+  FIREWALL_PORTS_ADDED="$(printf '%s\n' $prev_added $added | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')"
+}
+
+# Remove exactly the firewall openings this installer recorded as added (TD-8).
+remove_firewall_rules() {
+  local fw_type="$1" fw_ports="$2" p
+  [[ -z "$fw_ports" || -z "$fw_type" || "$fw_type" == "none" ]] && return 0
+  log "Removing firewall openings added at install time ($fw_type): $fw_ports"
+  case "$fw_type" in
+    firewalld)
+      if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for p in $fw_ports; do
+          firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 || true
+          log "  firewalld: closed $p"
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || true
+      fi ;;
+    ufw)
+      if command -v ufw >/dev/null 2>&1; then
+        for p in $fw_ports; do
+          ufw --force delete allow "$p" >/dev/null 2>&1 || true
+          log "  ufw: removed allow $p"
+        done
+      fi ;;
+  esac
+}
+
+# Persist install-time facts consumed by uninstall. First-run values win on
+# re-runs (they describe the true pre-install state of the host).
+write_state_file() {
+  local prev_takeover prev_nm_had prev_nm_val prev_resolved_active
+  prev_takeover="$(state_get RESOLVER_TAKEOVER)"
+  prev_nm_had="$(state_get NM_HAD_DNS_LINE)"
+  prev_nm_val="$(state_get NM_PREV_DNS_VALUE)"
+  prev_resolved_active="$(state_get RESOLVED_WAS_ACTIVE)"
+
+  local takeover="$RESOLVER_TAKEN_OVER"
+  [[ "$prev_takeover" == "true" ]] && takeover="true"
+  local nm_had="${prev_nm_had:-$NM_HAD_DNS_LINE}"
+  local nm_val="${prev_nm_val:-$NM_PREV_DNS_VALUE}"
+  local resolved_active="false"
+  [[ -f "${RESOLVER_SNAP_DIR:-/nonexistent}/resolved.state" ]] && resolved_active="true"
+  [[ -n "$prev_resolved_active" ]] && resolved_active="$prev_resolved_active"
+
+  mkdir -p /opt/technitium
+  {
+    echo "# Technitium DNS installer state - consumed by 'uninstall'. Do not edit."
+    echo "STATE_SCRIPT_VERSION=$SCRIPT_VERSION"
+    echo "INSTALLED_AT=$(date)"
+    echo "RESOLVER_TAKEOVER=$takeover"
+    echo "NM_HAD_DNS_LINE=$nm_had"
+    echo "NM_PREV_DNS_VALUE=$nm_val"
+    echo "RESOLVED_WAS_ACTIVE=$resolved_active"
+    echo "FIREWALL_TYPE=$FIREWALL_TYPE_DETECTED"
+    echo "FIREWALL_PORTS_ADDED=$FIREWALL_PORTS_ADDED"
+  } > "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
 }
 
 # ============================================================================ #
@@ -263,42 +594,48 @@ install_offline() {
     exit 1
   fi
 
-  # 5. systemd service + user + host DNS (mirrors upstream install.sh)
+  # 5. systemd service + user (mirrors upstream install.sh). The host-resolver
+  #    takeover deliberately does NOT happen here: it runs only after the
+  #    service is confirmed up (apply_resolver_policy, TD-4).
   if [[ "$(ps --no-headers -o comm 1 | tr -d '\n')" != "systemd" ]]; then
     log "ERROR: systemd was not detected; cannot install the dns.service unit."
     exit 1
   fi
 
+  id "$SERVICE_USER" &>/dev/null || useradd --system -M --shell /usr/sbin/nologin "$SERVICE_USER"
+  # Re-runs re-extract the package as root, so ownership must be reasserted on
+  # every run, not just the first (TD-13).
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$DNS_APP_DIR" "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
+
   if [[ -f "$SYSTEMD_UNIT" ]]; then
     log "Existing dns.service found -> restarting."
     debug_run systemctl restart dns.service
   else
-    id "$SERVICE_USER" &>/dev/null || useradd --system -M --shell /usr/sbin/nologin "$SERVICE_USER"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$DNS_APP_DIR" "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
     cp "$DNS_APP_DIR/systemd.service" "$SYSTEMD_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
     debug_run systemctl enable dns.service
-    if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
-      systemctl stop systemd-resolved >/dev/null 2>&1 || true
-      systemctl disable systemd-resolved >/dev/null 2>&1 || true
-      configure_host_resolver
-    fi
     debug_run systemctl start dns.service
   fi
 }
 
-# Point the host at 127.0.0.1 and stop NetworkManager from clobbering resolv.conf
-# (mirrors the upstream install.sh resolver handling).
-configure_host_resolver() {
-  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
-    if ! grep -qF "dns=" /etc/NetworkManager/NetworkManager.conf; then
-      printf "\n[main]\ndns=none\n" >> /etc/NetworkManager/NetworkManager.conf
-    elif ! grep -qF "dns=none" /etc/NetworkManager/NetworkManager.conf; then
-      sed -i "s/^dns=.*/dns=none/g" /etc/NetworkManager/NetworkManager.conf
-    fi
+# Verify the install actually produced a live service before anything gets
+# commandeered (TD-4) — and fail loudly when the fully-delegated upstream
+# install.sh path did not deliver (TD-20).
+verify_service_install() {
+  if [[ ! -f "$SYSTEMD_UNIT" ]]; then
+    log "ERROR: $SYSTEMD_UNIT not found after install - the install did not complete."
+    exit 1
   fi
-  [[ -f "$DNS_APP_DIR/resolv.conf.bak" ]] || cp -a /etc/resolv.conf "$DNS_APP_DIR/resolv.conf.bak" 2>/dev/null || true
-  rm -f /etc/resolv.conf
-  printf "# Generated by Technitium DNS Server Installer\n\nnameserver 127.0.0.1\n" > /etc/resolv.conf
+  local tries=0
+  while (( tries < 30 )); do
+    systemctl is-active --quiet dns.service && break
+    sleep 2; tries=$((tries+1))
+  done
+  if ! systemctl is-active --quiet dns.service; then
+    log "ERROR: dns.service is not active after install. Check 'journalctl -u dns.service'."
+    exit 1
+  fi
+  log "dns.service is active."
 }
 
 # ============================================================================ #
@@ -313,6 +650,7 @@ wait_for_webservice() {
     while (( tries < 30 )); do
       if curl -fsS -o /dev/null "http://127.0.0.1:${p}/api/user/login?user=x&pass=x" 2>/dev/null; then
         API_BASE="http://127.0.0.1:${p}"
+        SERVICE_CONFIRMED=1
         log "Web console reachable on port ${p}."
         return 0
       fi
@@ -325,6 +663,18 @@ wait_for_webservice() {
 
 json_field()     { grep -oP "\"$1\"\s*:\s*\"\K[^\"]+" | head -n1; }
 json_status_ok() { grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; }
+# Extract the IPv4 addresses of type-A records from a zones/records/get response.
+json_a_record_ips() { grep -oP '"type"\s*:\s*"A"[^{]*\{\s*"ipAddress"\s*:\s*"\K[0-9.]+' || true; }
+
+# Write a secret to a root-only temp file for curl's --data-urlencode name@file
+# form, keeping credentials off the process argv (TD-7). Caller must rm -f it.
+secret_tmp_file() {
+  local f
+  f="$(mktemp)"
+  chmod 600 "$f"
+  printf '%s' "$1" > "$f"
+  echo "$f"
+}
 
 # api_call <endpoint> [--data-urlencode k=v ...]
 # POST to the API with the session token added. All caller-supplied values must be
@@ -335,27 +685,60 @@ api_call() {
   curl -fsSk "${API_BASE}/${endpoint}" --data-urlencode "token=${API_TOKEN}" "$@"
 }
 
-# Log in (handles both first-run admin/admin and an already-changed password),
-# then ensure the password equals DNS_ADMIN_PASSWORD. Idempotent.
+# Log in and ensure the admin password equals DNS_ADMIN_PASSWORD. Idempotent.
+# Tries, in order: the desired password (re-runs), DNS_ADMIN_CURRENT_PASSWORD
+# (rotation, TD-11), and the factory default admin/admin (first install).
+# Passwords travel via 600-perm temp files, never on curl's argv (TD-7).
 api_login_and_set_password() {
-  local resp
+  local resp pw_file cur_file
+  pw_file="$(secret_tmp_file "$DNS_ADMIN_PASSWORD")"
+
   # 1. Try the desired password first (idempotent re-runs).
   resp=$(curl -fsSk "${API_BASE}/api/user/login" \
             --data-urlencode "user=${DNS_ADMIN_USER}" \
-            --data-urlencode "pass=${DNS_ADMIN_PASSWORD}" \
+            --data-urlencode "pass@${pw_file}" \
             --data-urlencode "includeInfo=true" || true)
   if echo "$resp" | json_status_ok; then
     API_TOKEN=$(echo "$resp" | json_field token)
+    rm -f "$pw_file"
     log "Authenticated as ${DNS_ADMIN_USER} (password already set)."
     return 0
   fi
-  # 2. Fall back to the factory default admin/admin and change the password.
+
+  # 2. Rotation: authenticate with the previous password, then set the new one.
+  if [[ -n "$DNS_ADMIN_CURRENT_PASSWORD" ]]; then
+    cur_file="$(secret_tmp_file "$DNS_ADMIN_CURRENT_PASSWORD")"
+    resp=$(curl -fsSk "${API_BASE}/api/user/login" \
+              --data-urlencode "user=${DNS_ADMIN_USER}" \
+              --data-urlencode "pass@${cur_file}" \
+              --data-urlencode "includeInfo=true" || true)
+    if echo "$resp" | json_status_ok; then
+      API_TOKEN=$(echo "$resp" | json_field token)
+      log "Authenticated with DNS_ADMIN_CURRENT_PASSWORD; rotating the admin password..."
+      if api_call api/user/changePassword \
+            --data-urlencode "pass@${cur_file}" \
+            --data-urlencode "newPass@${pw_file}" | json_status_ok; then
+        log "Admin password rotated."
+        rm -f "$pw_file" "$cur_file"
+        return 0
+      fi
+      rm -f "$pw_file" "$cur_file"
+      log "ERROR: authenticated with DNS_ADMIN_CURRENT_PASSWORD but failed to set the new password."
+      exit 1
+    fi
+    rm -f "$cur_file"
+  fi
+
+  # 3. Fall back to the factory default admin/admin and change the password.
   resp=$(curl -fsSk "${API_BASE}/api/user/login" \
             --data-urlencode "user=admin" \
             --data-urlencode "pass=admin" \
             --data-urlencode "includeInfo=true" || true)
   if ! echo "$resp" | json_status_ok; then
-    log "ERROR: could not authenticate with the configured or factory-default credentials."
+    rm -f "$pw_file"
+    log "ERROR: could not authenticate with the configured, rotation (DNS_ADMIN_CURRENT_PASSWORD), or factory-default credentials."
+    log "       If the admin password was changed earlier (e.g. a previous run used a different DNS_ADMIN_PASSWORD),"
+    log "       re-run with: DNS_ADMIN_CURRENT_PASSWORD='<old password>' DNS_ADMIN_PASSWORD='<new password>'"
     exit 1
   fi
   API_TOKEN=$(echo "$resp" | json_field token)
@@ -363,9 +746,11 @@ api_login_and_set_password() {
   # changePassword requires BOTH the current password (pass) and the new one (newPass).
   if api_call api/user/changePassword \
         --data-urlencode "pass=admin" \
-        --data-urlencode "newPass=${DNS_ADMIN_PASSWORD}" | json_status_ok; then
+        --data-urlencode "newPass@${pw_file}" | json_status_ok; then
     log "Admin password updated."
+    rm -f "$pw_file"
   else
+    rm -f "$pw_file"
     log "ERROR: failed to change the admin password."
     exit 1
   fi
@@ -425,6 +810,11 @@ configure_forwarders() {
 # Format: '# <zone>' headers; '<name> <ipv4>' records (relative label; '@' apex;
 # '*.x' wildcard; repeated name = round-robin). ';' lines and non-domain '#' lines
 # are comments.
+#
+# Convergence (TD-10): for every name that appears in the template, the A-record
+# set is made to EQUAL the template (stale IPs at that name are removed, so a
+# changed address does not become accidental round-robin with a dead IP).
+# Names NOT mentioned in the template are never touched (additive semantics).
 configure_zones_and_records() {
   [[ -z "$ZONES_TEMPLATE" ]] && return 0
   if [[ ! -f "$ZONES_TEMPLATE" ]]; then
@@ -434,6 +824,10 @@ configure_zones_and_records() {
   log "Creating zones + records from ${ZONES_TEMPLATE}..."
   local zone="" line hdr name ip domain
   local token_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+  # Pass 1: parse the template, create zones as headers are encountered, and
+  # collect the full desired A-record set per name.
+  local -a rec_domains=()
+  local -A rec_zone=() rec_ips=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"     # ltrim
@@ -457,8 +851,20 @@ configure_zones_and_records() {
       log "  WARNING: '$line' is not '<name> <ipv4>'; skipped."; continue
     fi
     if [[ "$name" == "@" ]]; then domain="$zone"; else domain="${name}.${zone}"; fi
-    record_add_a "$domain" "$ip"
+    if [[ -z "${rec_ips[$domain]:-}" ]]; then
+      rec_domains+=("$domain")
+      rec_zone[$domain]="$zone"
+      rec_ips[$domain]="$ip"
+    elif [[ " ${rec_ips[$domain]} " != *" $ip "* ]]; then
+      rec_ips[$domain]="${rec_ips[$domain]} $ip"
+    fi
   done < "$ZONES_TEMPLATE"
+  # Pass 2: converge each name's A-record set to the template.
+  local d
+  for d in "${rec_domains[@]}"; do
+    # shellcheck disable=SC2086
+    record_sync_a "${rec_zone[$d]}" "$d" ${rec_ips[$d]}
+  done
 }
 
 zone_create() {
@@ -471,6 +877,41 @@ zone_create() {
   else
     log "  WARNING: could not create zone '$z'."
   fi
+}
+
+# Converge the A-record set for one name (TD-10): remove A records at this name
+# that are not in the desired set, then add the missing ones.
+record_sync_a() {
+  local zone="$1" domain="$2"; shift 2
+  local -a desired=("$@") existing=()
+  local ip d keep
+  mapfile -t existing < <(api_call api/zones/records/get \
+        --data-urlencode "domain=${domain}" \
+        --data-urlencode "zone=${zone}" 2>/dev/null | json_a_record_ips)
+  for ip in "${existing[@]}"; do
+    keep=0
+    for d in "${desired[@]}"; do [[ "$ip" == "$d" ]] && { keep=1; break; }; done
+    if (( ! keep )); then
+      if api_call api/zones/records/delete \
+            --data-urlencode "domain=${domain}" \
+            --data-urlencode "zone=${zone}" \
+            --data-urlencode "type=A" \
+            --data-urlencode "ipAddress=${ip}" | json_status_ok; then
+        log "    A  ${domain} -x ${ip} (removed - not in template)"
+      else
+        log "    WARNING: could not remove stale A ${domain} -> ${ip}"
+      fi
+    fi
+  done
+  for ip in "${desired[@]}"; do
+    keep=0
+    for d in "${existing[@]}"; do [[ "$ip" == "$d" ]] && { keep=1; break; }; done
+    if (( keep )); then
+      log "    A  ${domain} -> ${ip} (exists)"
+    else
+      record_add_a "$domain" "$ip"
+    fi
+  done
 }
 
 record_add_a() {
@@ -594,8 +1035,28 @@ EOF
 # ============================================================================ #
 # -- save (build the air-gap bundle) --                                        #
 # ============================================================================ #
+
+# A failed save must not leave a loose sentinel behind: it would flip the next
+# 'install' on this host into air-gap mode (TD-17), and a partial archive could
+# be mistaken for a good one (W4).
+on_save_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )); then
+    log "ERROR: save did not complete (exit $rc); cleaning up partial artifacts."
+    rm -rf "${base_dir:?}/$BUNDLE_DIR"
+    rm -f "$base_dir/$SAVE_SENTINEL" "$base_dir/$SAVE_ARCHIVE.partial"
+  fi
+  exit "$rc"
+}
+
 run_save() {
+  check_root_privileges          # install-packages 'save' needs root (TD-16)
+  os_check
+  preflight_dependencies
+  init_log
   log "# -- Building Technitium air-gap bundle - $(date) -- #"
+  trap on_save_exit EXIT
   local b="$base_dir/$BUNDLE_DIR"
   rm -rf "$b"; mkdir -p "$b/utilities"
 
@@ -624,7 +1085,8 @@ run_save() {
   ( cd "$b/utilities" && debug_run ./install_packages.sh save "$icu" )
 
   # 5. The installer itself + sentinel/manifest
-  cp "$base_dir/$SCRIPT_NAME" "$b/"
+  cp "$script_dir/$SCRIPT_NAME" "$b/"
+  chmod +x "$b/$SCRIPT_NAME"
   cat > "$base_dir/$SAVE_SENTINEL" << EOF
 # Technitium DNS Server Installer - air-gap bundle manifest
 # Created:        $(date)
@@ -642,11 +1104,17 @@ EOF
   # 6. LICENSES/ — third-party manifest + GPL written offer (compliance)
   generate_bundle_licenses "$b"
 
-  tar -czf "$base_dir/$SAVE_ARCHIVE" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL"
+  # The installer + sentinel sit at the TOP level of the archive so the documented
+  # flow ('tar -xzf ...; sudo ./technitium_dns_installer.sh install') works
+  # verbatim (TD-5). The copies inside $BUNDLE_DIR are kept for compatibility.
+  # Build atomically: write to a temp name, then move into place (W4).
+  tar -czf "$base_dir/$SAVE_ARCHIVE.partial" -C "$base_dir" "$BUNDLE_DIR" "$SAVE_SENTINEL" "$SCRIPT_NAME"
+  mv -f "$base_dir/$SAVE_ARCHIVE.partial" "$base_dir/$SAVE_ARCHIVE"
   # The sentinel is preserved inside the archive; remove the loose copies from the
   # build host so a later 'install' here is not mistaken for an air-gapped run.
   rm -rf "$b"
   rm -f "$base_dir/$SAVE_SENTINEL"
+  trap - EXIT
   log ""
   log "Bundle ready: $base_dir/$SAVE_ARCHIVE"
   log "Transfer it to the air-gapped host, extract it ('tar -xzf $SAVE_ARCHIVE'),"
@@ -659,11 +1127,14 @@ EOF
 run_upgrade() {
   check_root_privileges
   os_check
+  preflight_dependencies
+  init_log
   if [[ ! -f "$SYSTEMD_UNIT" ]]; then
     log "ERROR: no existing dns.service found. Run 'install' first."
     exit 1
   fi
   air_gap_check
+  snapshot_resolver_state
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
     log "Upgrading (offline) from bundle..."
     local b="$base_dir/$BUNDLE_DIR"
@@ -674,42 +1145,132 @@ run_upgrade() {
   else
     log "Upgrading (online) via upstream install.sh (config in $DNS_CONFIG_DIR is preserved)..."
     install_online
+    online_resolver_compensate
   fi
+  verify_service_install
+  rm -rf "$RESOLVER_SNAP_DIR"
   log "Upgrade complete."
 }
 
 # ============================================================================ #
 # -- uninstall (non-interactive replica of upstream uninstall.sh) --           #
 # ============================================================================ #
+
+# Evidence that an install commandeered the host resolver: the state marker, a
+# resolver backup, the installer-written resolv.conf header, or (heuristic for
+# pre-marker installs) a live unit plus resolv.conf pointing at 127.0.0.1.
+resolver_takeover_evident() {
+  local dnsDir="$1" unit_present="$2" st_takeover="$3"
+  [[ "$st_takeover" == "true" ]] && return 0
+  [[ -e "$dnsDir/resolv.conf.bak" || -L "$dnsDir/resolv.conf.bak" ]] && return 0
+  grep -qs "Generated by Technitium DNS Server Installer" /etc/resolv.conf && return 0
+  if (( unit_present )) && grep -qsE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1' /etc/resolv.conf; then
+    return 0
+  fi
+  return 1
+}
+
+restore_resolver_on_uninstall() {
+  local dnsDir="$1" nm_had="$2" nm_val="$3" resolved_was_active="$4"
+  local bak="$dnsDir/resolv.conf.bak"
+  rm -f /etc/resolv.conf
+  if [[ -f "$bak" ]] && ! grep -q '127\.0\.0\.1' "$bak" 2>/dev/null; then
+    # Regular backup (or symlink to an existing file): restore its contents as
+    # a real file — never re-create a symlink that may dangle (TD-14).
+    cat "$bak" > /etc/resolv.conf
+  elif [[ -f "$bak" ]]; then
+    # Backup was clobbered with the takeover content (upstream online re-runs
+    # overwrite it) — restoring it would restore 127.0.0.1 with no server.
+    log "resolv.conf backup contains the takeover content; falling back to public nameservers."
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  elif [[ -L "$bak" ]]; then
+    # Dangling symlink backup from a pre-fix install (TD-14).
+    log "resolv.conf backup is a dangling symlink; falling back to public nameservers."
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  else
+    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+  fi
+
+  if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
+    if [[ "$nm_had" == "true" && -n "$nm_val" && "$nm_val" != "none" ]]; then
+      sed -i "s/^dns=none/dns=${nm_val}/" /etc/NetworkManager/NetworkManager.conf || true
+    else
+      # No trustworthy pre-install value (or the recorded value is the
+      # installer's own 'none') — remove the line entirely so NetworkManager
+      # resumes managing resolv.conf (P4-03)
+      sed -i '/^dns=none$/d' /etc/NetworkManager/NetworkManager.conf || true
+    fi
+    # Without a reload NetworkManager keeps the takeover config until the next
+    # reboot and resolv.conf never self-heals (P4-03)
+    systemctl try-reload-or-restart NetworkManager >/dev/null 2>&1 || true
+  fi
+
+  # Re-enable systemd-resolved when the state marker says it was active before
+  # install, when the restored resolv.conf needs the resolved stub, or (legacy,
+  # no state marker) per the DISABLE_SYSTEMD_RESOLVED env as before.
+  local reenable=0
+  [[ "$resolved_was_active" == "true" ]] && reenable=1
+  grep -qs '127\.0\.0\.53' /etc/resolv.conf && reenable=1
+  [[ -z "$resolved_was_active" && "$DISABLE_SYSTEMD_RESOLVED" == "true" ]] && reenable=1
+  if (( reenable )); then
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
+    systemctl start  systemd-resolved >/dev/null 2>&1 || true
+  fi
+  log "Host resolver restored."
+}
+
 run_uninstall() {
   check_root_privileges
+  init_log
   log "# -- Uninstalling Technitium DNS Server - $(date) -- #"
+
   local dnsDir="$DNS_APP_DIR"
-  [[ -d /etc/dns/config && ! -d "$DNS_APP_DIR" ]] && dnsDir="/etc/dns"
+  # Legacy-layout fallback: only when /etc/dns actually CONTAINS the app.
+  # Otherwise a second uninstall run would select the preserved config dir and
+  # purge it despite PURGE_DATA=false (TD-1).
+  if [[ ! -d "$DNS_APP_DIR" && -f "$DNS_CONFIG_DIR/DnsServerApp.dll" ]]; then
+    dnsDir="$DNS_CONFIG_DIR"
+  fi
+
+  local unit_present=0
+  [[ -f "$SYSTEMD_UNIT" ]] && unit_present=1
+
+  # TD-2: never touch the resolver or firewall on a host this installer (or the
+  # upstream scripts) never installed on.
+  if [[ ! -f "$SYSTEMD_UNIT" && ! -d "$DNS_APP_DIR" && ! -f "$DNS_CONFIG_DIR/DnsServerApp.dll" && ! -f "$STATE_FILE" ]]; then
+    log "No Technitium DNS Server installation found (no dns.service unit, app directory, or installer state)."
+    log "Nothing to uninstall; host resolver and firewall left untouched."
+    return 0
+  fi
+
+  local st_takeover st_fw_type st_fw_ports st_nm_had st_nm_val st_resolved_active
+  st_takeover="$(state_get RESOLVER_TAKEOVER)"
+  st_fw_type="$(state_get FIREWALL_TYPE)"
+  st_fw_ports="$(state_get FIREWALL_PORTS_ADDED)"
+  st_nm_had="$(state_get NM_HAD_DNS_LINE)"
+  st_nm_val="$(state_get NM_PREV_DNS_VALUE)"
+  st_resolved_active="$(state_get RESOLVED_WAS_ACTIVE)"
 
   if [[ "$(ps --no-headers -o comm 1 | tr -d '\n')" == "systemd" ]]; then
     systemctl disable dns.service >/dev/null 2>&1 || true
     systemctl stop dns.service    >/dev/null 2>&1 || true
     rm -f "$SYSTEMD_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true   # drop the stale unit (TD-18)
 
-    # Restore host resolver
-    rm -f /etc/resolv.conf
-    if [[ -f "$dnsDir/resolv.conf.bak" ]]; then
-      cp -a "$dnsDir/resolv.conf.bak" /etc/resolv.conf
+    # Restore the host resolver only on evidence that an install actually
+    # commandeered it (TD-2).
+    if resolver_takeover_evident "$dnsDir" "$unit_present" "$st_takeover"; then
+      restore_resolver_on_uninstall "$dnsDir" "$st_nm_had" "$st_nm_val" "$st_resolved_active"
     else
-      printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
-    fi
-    if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
-      sed -i "s/^dns=none/dns=default/g" /etc/NetworkManager/NetworkManager.conf || true
-    fi
-    if [[ "$DISABLE_SYSTEMD_RESOLVED" == "true" ]]; then
-      systemctl enable systemd-resolved >/dev/null 2>&1 || true
-      systemctl start  systemd-resolved >/dev/null 2>&1 || true
+      log "No evidence the installer commandeered the host resolver; leaving /etc/resolv.conf, NetworkManager and systemd-resolved untouched."
     fi
     userdel -f "$SERVICE_USER" >/dev/null 2>&1 || true
   fi
 
+  remove_firewall_rules "$st_fw_type" "$st_fw_ports"
+
   rm -rf "$dnsDir"
+  rm -f "$STATE_FILE"
   # Drop the now-empty /opt/technitium parent (upstream leaves it behind).
   [[ "$dnsDir" == "$DNS_APP_DIR" ]] && rmdir /opt/technitium 2>/dev/null || true
 
@@ -723,8 +1284,12 @@ run_uninstall() {
   if [[ "$PURGE_DATA" == "true" && -d "$DNS_CONFIG_DIR" ]]; then
     log "Purging config/zone data ($DNS_CONFIG_DIR)..."
     rm -rf "$DNS_CONFIG_DIR" "$DNS_LOG_DIR"
+    rmdir /var/log/technitium 2>/dev/null || true
   else
+    # Reset preserved dirs to root ownership — the dns-server user is gone and
+    # orphan-UID files would linger otherwise (TD-18).
     [[ -d "$DNS_CONFIG_DIR" ]] && chown -R root:root "$DNS_CONFIG_DIR" 2>/dev/null || true
+    [[ -d "$DNS_LOG_DIR" ]]    && chown -R root:root "$DNS_LOG_DIR"    2>/dev/null || true
     log "Config folder $DNS_CONFIG_DIR preserved (set PURGE_DATA=true to delete it)."
   fi
   log "Uninstall complete."
@@ -733,18 +1298,48 @@ run_uninstall() {
 # ============================================================================ #
 # -- install orchestrator --                                                   #
 # ============================================================================ #
+
+# EXIT trap while installing (TD-4): if the run dies before the DNS service was
+# confirmed up, put the resolver back the way it was — never strand the host
+# with 'nameserver 127.0.0.1' and nothing answering on :53.
+on_install_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )); then
+    log "ERROR: install did not complete (exit $rc)."
+    if (( SERVICE_CONFIRMED == 0 )) && resolver_state_changed; then
+      log "Restoring the pre-install resolver state (the DNS service was never confirmed up)..."
+      restore_resolver_snapshot
+      log "Resolver restored."
+    fi
+  fi
+  [[ -n "${RESOLVER_SNAP_DIR:-}" ]] && rm -rf "$RESOLVER_SNAP_DIR"
+  exit "$rc"
+}
+
 run_install() {
   check_root_privileges
   os_check
+  preflight_dependencies
   : > "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
   log "# -- Technitium DNS Server Installer v${SCRIPT_VERSION} Started - $(date) -- #"
   air_gap_check
+  snapshot_resolver_state
+  trap on_install_exit EXIT
   if [[ "$AIR_GAPPED_MODE" -eq 1 ]]; then
     install_offline
   else
     install_online
+    online_resolver_compensate   # TD-3: honour DISABLE_SYSTEMD_RESOLVED=false online
   fi
+  verify_service_install         # TD-20: don't trust the delegated path blindly
   configure_dns_server
+  apply_resolver_policy          # TD-4: takeover only after the service is confirmed up
+  configure_firewall             # TD-8: after config, so the final web port is known
+  write_state_file
+  trap - EXIT
+  rm -rf "$RESOLVER_SNAP_DIR"
 
   log ""
   log "================================================================"
@@ -754,7 +1349,11 @@ run_install() {
   fi
   log "  Web console : http://$(hostname -I | awk '{print $1}'):${DNS_WEB_PORT}/"
   log "  Username    : ${DNS_ADMIN_USER}"
-  log "  Password    : ${DNS_ADMIN_PASSWORD}"
+  if [[ "$DNS_ADMIN_PASSWORD" == "changeme" ]]; then
+    log "  Password    : the default 'changeme' - CHANGE IT (set DNS_ADMIN_PASSWORD)"
+  else
+    log "  Password    : (set from DNS_ADMIN_PASSWORD - not logged)"
+  fi
   log "================================================================"
 }
 
@@ -773,7 +1372,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$SAVE_MODE" -eq 1 ]];      then os_check; : > "$LOG_FILE"; run_save; fi
+if [[ "$SAVE_MODE" -eq 1 ]];      then run_save; fi
 if [[ "$UPGRADE_MODE" -eq 1 ]];   then run_upgrade; fi
 if [[ "$UNINSTALL_MODE" -eq 1 ]]; then run_uninstall; fi
 if [[ "$INSTALL_MODE" -eq 1 ]];   then run_install; fi
