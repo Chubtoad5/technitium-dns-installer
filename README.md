@@ -73,7 +73,7 @@ reminds you loudly if you left the default `changeme` in place.
 | `install` | Install the DNS server (default). Uses the upstream `install.sh` when online; runs fully offline if an air-gap bundle is present. Then applies the admin password and web-service settings. |
 | `save` | Build an air-gap bundle (`technitium-save.tar.gz`) containing the DNS package, the ASP.NET Core runtime, the `libicu` package, and the installer. |
 | `upgrade` | Upgrade an existing install to the latest DNS Server build. Online re-runs `install.sh`; offline extracts the bundled build. Config in `/etc/dns` is preserved. |
-| `uninstall` | Stop and remove the DNS server (non-interactive). Honours `PURGE_DATA` and `REMOVE_DOTNET`. |
+| `uninstall` | Stop and remove the DNS server (non-interactive). Honours `PURGE_DATA` and `REMOVE_DOTNET`. Restores the host resolver from the recorded pre-install state; when the resolv.conf backup was overwritten by online re-runs (upstream `install.sh` re-copies it every run) and the host ran `systemd-resolved` before install, resolution is handed back to resolved's stub (v1.2.1) rather than pinned to public nameservers. |
 | `help` | Show usage. |
 
 ---

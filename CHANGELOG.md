@@ -1,5 +1,20 @@
 # Changelog — technitium-dns-installer
 
+## v1.2.1 — 2026-09-11 — uninstall: hand the resolver back to systemd-resolved after online re-runs (fix/uninstall-resolved-stub-restore)
+
+### Fixed
+- **`uninstall` no longer pins public nameservers on a systemd-resolved host after online re-runs.** Upstream
+  `install.sh` runs `cp -a /etc/resolv.conf $dnsDir/resolv.conf.bak` on *every* online run, so any online
+  re-run after the first replaces the pre-install backup with the `127.0.0.1` takeover content. `uninstall`
+  then had no usable backup and wrote `8.8.8.8` / `1.1.1.1` into `/etc/resolv.conf` — the host kept resolving
+  public names but silently lost its site resolver (internal names stopped resolving). When the recorded state
+  says `RESOLVED_WAS_ACTIVE=true`, the fallback now re-enables/starts `systemd-resolved` and re-links
+  `/etc/resolv.conf` to its stub (`../run/systemd/resolve/stub-resolv.conf`, which exists again because resolved
+  is running, so it cannot dangle), so the host's netplan/DHCP DNS servers are honoured again (TD-23). Hosts
+  without systemd-resolved keep the previous public-nameserver fallback. Found by the ap-tools `install dns-server`
+  smoke (re-run/convergence then uninstall).
+- `SCRIPT_VERSION` 1.2.0 → 1.2.1.
+
 ## 1.2.0 — Idempotence release (feature/idempotence-phase2)
 
 Idempotence, resolver-safety and secrets-hygiene pass. A failed install can no longer strand

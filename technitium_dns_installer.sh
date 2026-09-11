@@ -14,7 +14,7 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 # Anchor to the script's own directory (TD-6): the air-gap bundle/sentinel are
 # expected next to the script. air_gap_check keeps a compat fallback to $PWD.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -1173,22 +1173,49 @@ resolver_takeover_evident() {
 restore_resolver_on_uninstall() {
   local dnsDir="$1" nm_had="$2" nm_val="$3" resolved_was_active="$4"
   local bak="$dnsDir/resolv.conf.bak"
+  local no_backup=0
   rm -f /etc/resolv.conf
   if [[ -f "$bak" ]] && ! grep -q '127\.0\.0\.1' "$bak" 2>/dev/null; then
     # Regular backup (or symlink to an existing file): restore its contents as
     # a real file — never re-create a symlink that may dangle (TD-14).
     cat "$bak" > /etc/resolv.conf
   elif [[ -f "$bak" ]]; then
-    # Backup was clobbered with the takeover content (upstream online re-runs
-    # overwrite it) — restoring it would restore 127.0.0.1 with no server.
-    log "resolv.conf backup contains the takeover content; falling back to public nameservers."
-    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+    # Backup was clobbered with the takeover content: the upstream install.sh
+    # does 'cp -a /etc/resolv.conf resolv.conf.bak' on EVERY online run, so any
+    # online re-run after the first replaces the real backup with 127.0.0.1.
+    log "resolv.conf backup contains the takeover content (upstream online re-runs overwrite it)."
+    no_backup=1
   elif [[ -L "$bak" ]]; then
     # Dangling symlink backup from a pre-fix install (TD-14).
-    log "resolv.conf backup is a dangling symlink; falling back to public nameservers."
-    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+    log "resolv.conf backup is a dangling symlink."
+    no_backup=1
   else
-    printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+    no_backup=1
+  fi
+  if (( no_backup )); then
+    if [[ "$resolved_was_active" == "true" ]]; then
+      # TD-23: the host resolved through systemd-resolved before the install, so
+      # hand resolution back to it (its upstream servers still come from
+      # netplan/DHCP/NetworkManager) instead of pinning public nameservers, which
+      # would silently drop the site's own DNS (internal names stop resolving).
+      log "systemd-resolved was active before install; handing /etc/resolv.conf back to its stub resolver."
+      systemctl enable systemd-resolved >/dev/null 2>&1 || true
+      systemctl start  systemd-resolved >/dev/null 2>&1 || true
+      for _ in 1 2 3 4 5; do
+        [[ -e /run/systemd/resolve/stub-resolv.conf ]] && break
+        sleep 1
+      done
+      if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+        # The standard systemd-resolved layout: a symlink to the live stub file,
+        # which exists because resolved is running again (so it cannot dangle now).
+        ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+      else
+        printf "nameserver 127.0.0.53\noptions edns0 trust-ad\n" > /etc/resolv.conf
+      fi
+    else
+      log "No usable pre-install resolv.conf; falling back to public nameservers."
+      printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+    fi
   fi
 
   if [[ -f /etc/NetworkManager/NetworkManager.conf ]]; then
