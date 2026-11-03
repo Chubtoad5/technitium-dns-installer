@@ -1387,6 +1387,11 @@ run_install() {
 # ============================================================================ #
 # -- argument dispatch --                                                      #
 # ============================================================================ #
+# When sourced by a test harness, stop here: only the functions above are wanted.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 [[ $# -eq 0 ]] && usage 1
 while [[ $# -gt 0 ]]; do
   case "$1" in
