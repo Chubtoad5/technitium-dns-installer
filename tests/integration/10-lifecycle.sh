@@ -5,7 +5,17 @@ REPO=$PWD
 fail=0
 ok()  { echo "PASS  $1"; }
 bad() { echo "FAIL  $1"; fail=1; }
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsutils >/dev/null 2>&1
+# Test tools, on whichever package manager this host has. Named the way apt names them, with the other names in the case.
+pkg_install() {
+  if command -v apt-get >/dev/null; then
+    apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
+  elif command -v dnf >/dev/null; then
+    dnf install -y -q "${@/#dnsutils/bind-utils}" >/dev/null 2>&1
+  else
+    zypper -n -q install "${@/#dnsutils/bind-utils}" >/dev/null 2>&1
+  fi
+}
+pkg_install dnsutils
 W=$(mktemp -d); cd "$W" || exit 1
 cp "$REPO/technitium_dns_installer.sh" .; chmod +x technitium_dns_installer.sh
 printf '# test.lab\nweb 10.0.0.9\n' > zones.txt
