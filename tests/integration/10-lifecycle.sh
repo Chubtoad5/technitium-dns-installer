@@ -19,7 +19,7 @@ pkg_install dnsutils
 W=$(mktemp -d); cd "$W" || exit 1
 cp "$REPO/technitium_dns_installer.sh" .; chmod +x technitium_dns_installer.sh
 printf '# test.lab\nweb 10.0.0.9\n' > zones.txt
-export ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
+export DNS_ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
 ./technitium_dns_installer.sh install >"$W/o" 2>&1 && ok "install" || { bad "install"; tail -6 "$W/o" | cut -c1-170; }
 [ "$(dig +short +time=3 @127.0.0.1 web.test.lab)" = 10.0.0.9 ] && ok "the zone's record resolves" || bad "the record doesn't resolve"
 ./technitium_dns_installer.sh install >"$W/o" 2>&1 && ok "same-settings re-run" || { bad "re-run"; tail -6 "$W/o" | cut -c1-170; }
