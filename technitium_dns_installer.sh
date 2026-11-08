@@ -14,7 +14,7 @@ set -o nounset
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.3.0"
 # Anchor to the script's own directory (TD-6): the air-gap bundle/sentinel are
 # expected next to the script. air_gap_check keeps a compat fallback to $PWD.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -31,7 +31,9 @@ TECHNITIUM_UNINSTALL_URL=${TECHNITIUM_UNINSTALL_URL:-"https://download.technitiu
 TECHNITIUM_PACKAGE_URL=${TECHNITIUM_PACKAGE_URL:-"https://download.technitium.com/dns/DnsServerPortable.tar.gz"}
 DOTNET_INSTALL_URL=${DOTNET_INSTALL_URL:-"https://dot.net/v1/dotnet-install.sh"}
 DOTNET_VERSION=${DOTNET_VERSION:-"10.0"}
-INSTALL_PACKAGES_URL=${INSTALL_PACKAGES_URL:-"https://raw.githubusercontent.com/Chubtoad5/install-packages/main/install_packages.sh"}
+INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.2"}       # install-packages release (tag, branch or commit) whose install_packages.sh save bundles (spec 12)
+INSTALL_PACKAGES_URL=${INSTALL_PACKAGES_URL:-"https://raw.githubusercontent.com/Chubtoad5/install-packages/${INSTALL_PACKAGES_REF}/install_packages.sh"}  # wins over the ref
+INSTALL_PACKAGES_SHA256=${INSTALL_PACKAGES_SHA256:-""}       # optional sha256 of install_packages.sh; a mismatch stops save
 
 # -- Licensing (air-gap bundle GPL/AGPL source-offer contact) -- #
 LICENSE_OFFER_CONTACT=${LICENSE_OFFER_CONTACT:-"the Chubtoad5 project via https://github.com/Chubtoad5"}
@@ -282,6 +284,31 @@ air_gap_check() {
   done
   log "No air-gap bundle found -> online install."
   return 0
+}
+
+# fetch_helper <dest> <url> <ref> [sha256]: a helper script at a given ref (spec 12, as Harbor does). A copy is reused
+# only when the .ref file beside it names the same ref, and the record goes into the bundle, so the bundle says which
+# release it holds. A failed download or a checksum mismatch leaves no file behind.
+fetch_helper() {
+  local dest="$1" url="$2" ref="$3" sha="${4:-}" ref_file
+  ref_file="$(dirname "$dest")/.$(basename "$dest").ref"
+  if [[ -s "$dest" && "$(cat "$ref_file" 2>/dev/null)" == "$ref" ]]; then
+    return 0
+  fi
+  log "Fetching $(basename "$dest") ($ref)..."
+  if ! curl -fsSL --retry 3 -o "$dest.tmp" "$url"; then
+    rm -f "$dest.tmp"
+    log "ERROR: failed to download $(basename "$dest") from: $url"
+    return 1
+  fi
+  if [[ -n "$sha" ]] && ! echo "$sha  $dest.tmp" | sha256sum -c --status; then
+    rm -f "$dest.tmp"
+    log "ERROR: $(basename "$dest") from $url doesn't match INSTALL_PACKAGES_SHA256."
+    return 1
+  fi
+  mv "$dest.tmp" "$dest"
+  chmod +x "$dest"
+  printf '%s\n' "$ref" > "$ref_file"
 }
 
 require_internet_artifact() {
@@ -1077,8 +1104,8 @@ run_save() {
   rm -rf "$b/_dotnet" "$dotnet_install"
 
   # 4. install-packages.sh + the libicu OS package (offline-installable)
-  require_internet_artifact "$INSTALL_PACKAGES_URL" "$b/utilities/install_packages.sh" "install_packages.sh"
-  chmod +x "$b/utilities/install_packages.sh"
+  # save only runs online, and an offline install uses this bundled copy, so an air-gapped run never downloads it
+  fetch_helper "$b/utilities/install_packages.sh" "$INSTALL_PACKAGES_URL" "$INSTALL_PACKAGES_REF" "$INSTALL_PACKAGES_SHA256" || exit 1
   local icu; icu="$(icu_package_name)"
   echo "$icu" > "$b/utilities/icu-package.txt"
   log "Saving OS package '$icu' for offline install..."
