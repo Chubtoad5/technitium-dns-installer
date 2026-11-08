@@ -8,7 +8,7 @@ bad() { echo "FAIL  $1"; fail=1; }
 W=$(mktemp -d -p /var/tmp); cd "$W" || exit 1
 tar -xzf "$CI_HANDOFF/technitium-save.tar.gz" && ok "unpack the bundle" || { bad "unpack the bundle"; echo "=== exit 1"; exit 1; }
 printf '# test.lab\nweb 10.0.0.9\n' > zones.txt
-export ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
+export DNS_ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
 ./technitium_dns_installer.sh install > "$W/o" 2>&1 && ok "install with no route out" || { bad "install with no route out"; tail -8 "$W/o" | cut -c1-170; }
 grep -q "Air-gap bundle detected" "$W/o" && ok "it installs from the bundle" || bad "it didn't say it used the bundle"
 systemctl is-active -q dns && ok "the service runs" || bad "the service isn't running"
