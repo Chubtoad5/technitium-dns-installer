@@ -1,5 +1,20 @@
 # Changelog — technitium-dns-installer
 
+## v1.3.0 — 2026-11-08 — save bundles install_packages.sh from a release
+
+### Changed
+- **`save` bundles `install_packages.sh` from an `install-packages` release, `v1.1.2`, instead of `main`.** So a merge in
+  `install-packages` no longer reaches this installer's bundles, or `ap-tools`, until a pin moves (spec 12). The bundle
+  records the ref in `utilities/.install_packages.sh.ref`. An offline install uses the bundled copy, as before.
+
+### Added
+- **`INSTALL_PACKAGES_REF`** (default `v1.1.2`): the tag, branch or commit to fetch. `INSTALL_PACKAGES_URL` still wins.
+- **`INSTALL_PACKAGES_SHA256`**: an optional checksum. A mismatch, or a failed download, stops `save` and leaves no file.
+
+### Tests
+- `tests/unit/helper-pins.bats`: the default tag, the ref and URL settings, the ref record, reuse and refetch, both
+  checksum cases, a failed download, and that only `save` downloads the helper.
+
 ## v1.2.1 — 2026-09-11 — uninstall: hand the resolver back to systemd-resolved after online re-runs (fix/uninstall-resolved-stub-restore)
 
 ### Fixed

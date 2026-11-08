@@ -106,6 +106,11 @@ sudo DNS_ADMIN_CURRENT_PASSWORD='OldPass1!' DNS_ADMIN_PASSWORD='NewPass2!' \
 **Source/version override knobs** (rarely needed): `TECHNITIUM_INSTALL_URL`, `TECHNITIUM_UNINSTALL_URL`,
 `TECHNITIUM_PACKAGE_URL`, `DOTNET_INSTALL_URL`, `DOTNET_VERSION`, `INSTALL_PACKAGES_URL`.
 
+**Which `install_packages.sh` `save` bundles:** the `install-packages` release in `INSTALL_PACKAGES_REF`, `v1.1.2` by
+default (a tag, branch or commit). `INSTALL_PACKAGES_URL` wins over it, for a mirror, and `INSTALL_PACKAGES_SHA256` is an
+optional checksum: a mismatch stops `save`. The bundle records the ref in `utilities/.install_packages.sh.ref`. An
+offline install uses the bundled copy and never downloads.
+
 ---
 
 ## DNS Configuration (zones, forwarders, DNSSEC, DHCP)
