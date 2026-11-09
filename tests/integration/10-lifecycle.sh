@@ -18,6 +18,7 @@ pkg_install() {
 pkg_install dnsutils
 W=$(mktemp -d); cd "$W" || exit 1
 cp "$REPO/technitium_dns_installer.sh" .; chmod +x technitium_dns_installer.sh
+before=$(cat /etc/resolv.conf)
 printf '# test.lab\nweb 10.0.0.9\n' > zones.txt
 export DNS_ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
 ./technitium_dns_installer.sh install >"$W/o" 2>&1 && ok "install" || { bad "install"; tail -6 "$W/o" | cut -c1-170; }
@@ -25,4 +26,5 @@ export DNS_ADMIN_PASSWORD=Test-Pass-1 ZONES_TEMPLATE="$W/zones.txt"
 ./technitium_dns_installer.sh install >"$W/o" 2>&1 && ok "same-settings re-run" || { bad "re-run"; tail -6 "$W/o" | cut -c1-170; }
 PURGE_DATA=true ./technitium_dns_installer.sh uninstall >"$W/o" 2>&1 && ok "uninstall" || { bad "uninstall"; tail -6 "$W/o" | cut -c1-170; }
 systemctl is-active --quiet dns && bad "the service is still running" || ok "the service is gone"
+[ "$(cat /etc/resolv.conf)" = "$before" ] && ok "uninstall puts resolv.conf back as it was" || bad "resolv.conf differs from before the install"
 echo "=== exit $fail"; exit $fail
